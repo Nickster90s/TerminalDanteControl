@@ -12,7 +12,16 @@ import time
 
 from . import mdns, proto
 
-PAGES = ("Discover", "Sync")
+PAGES = ("Discover", "Sync", "Routing")
+
+# Grid glyphs. A subscription a device calls resolved and running looks
+# different from one it merely remembers -- an A16R on the bench holds channels
+# pointed at a Yamaha that is switched off, and those must not read as patched.
+CELL_ACTIVE = "●"
+CELL_UNRESOLVED = "○"
+CELL_EMPTY = "·"
+COL_PITCH = 2                # one glyph plus one space per transmit channel
+LABEL_W = 20                 # width of the receive-channel label column
 
 C_DEFAULT = 0
 C_HEAD = 1
@@ -270,6 +279,17 @@ class App:
         # way to stay correct through resizes and scrolling.
         self.tab_hits = []          # (y, x0, x1, page index)
         self.row_hits = {}          # screen y -> device index
+        # Routing page state.
+        self.route_tx_ip = None
+        self.route_rx_ip = None
+        self.cur_row = 0            # cursor in the grid, indices into the lists
+        self.cur_col = 0
+        self.grid_scroll_row = 0
+        self.grid_scroll_col = 0
+        self.grid_geom = None       # (x0, y0, rows, cols) of the painted grid
+        self.selector_hits = []     # (y, x0, x1, "tx"/"rx")
+        self.dropdown = None        # open device chooser, if any
+        self.confirm = None         # pending write, waiting for y/n
         self.mouse = enable_mouse() if mouse_enabled else False
         curses.curs_set(0)
         stdscr.nodelay(True)
@@ -317,6 +337,23 @@ class App:
 
     def handle_key(self, ch):
         devices = self.engine.snapshot()
+
+        # A pending write owns the keyboard until it is answered. Only an
+        # explicit y goes ahead; every other key cancels.
+        if self.confirm:
+            action = self.confirm
+            self.confirm = None
+            if ch in (ord("y"), ord("Y")):
+                ok = action["action"]()
+                self.flash(action["done"] if ok else
+                           "refused: passive mode is on (press a to allow writes)")
+            else:
+                self.flash("cancelled")
+            return True
+
+        if self.dropdown:
+            return self.handle_dropdown_key(ch, devices)
+
         if ch in (ord("q"), 27):
             return False
         elif ch in (ord("\t"), curses.KEY_BTAB):
@@ -325,6 +362,20 @@ class App:
             self.page = 0
         elif ch == ord("2"):
             self.page = 1
+        elif ch == ord("3"):
+            self.page = 2
+        elif self.page == 2 and ch in (ord("s"), ord("d")):
+            self.open_dropdown("tx" if ch == ord("s") else "rx", devices)
+        elif self.page == 2 and ch in (curses.KEY_LEFT, ord("h")):
+            self.cur_col = max(0, self.cur_col - 1)
+        elif self.page == 2 and ch in (curses.KEY_RIGHT, ord("l")):
+            self.cur_col += 1
+        elif self.page == 2 and ch in (curses.KEY_DOWN, ord("j")):
+            self.cur_row += 1
+        elif self.page == 2 and ch in (curses.KEY_UP, ord("k")):
+            self.cur_row = max(0, self.cur_row - 1)
+        elif self.page == 2 and ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+            self.toggle_subscription(devices)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.sel = min(self.sel + 1, max(0, len(devices) - 1))
         elif ch in (curses.KEY_UP, ord("k")):
@@ -339,18 +390,101 @@ class App:
             self.sel = max(0, len(devices) - 1)
         elif ch == ord("r"):
             self.engine.refresh()
+            self.engine.refresh_channels()
             self.flash("refresh sent: mDNS browse + ARC + info to %d device(s)" % len(devices))
         elif ch == ord("a"):
             self.engine.passive = not self.engine.passive
             self.flash("passive (listen-only) mode ON" if self.engine.passive
                        else "active polling ON")
-        elif ch == ord("l"):
+        elif ch == ord("L"):
+            # Capital L: lowercase l moves the routing cursor right.
             self.show_log = not self.show_log
         elif ch == curses.KEY_MOUSE:
             self.handle_mouse(devices)
         elif ch == curses.KEY_RESIZE:
             self.stdscr.clear()
         return True
+
+    # -- routing interaction ----------------------------------------------
+
+    def open_dropdown(self, kind, devices):
+        current = self.route_tx_ip if kind == "tx" else self.route_rx_ip
+        sel = 0
+        for i, d in enumerate(devices):
+            if d.ip == current:
+                sel = i
+                break
+        box = next((s for s in self.selector_hits if s[3] == kind), None)
+        self.dropdown = {
+            "kind": kind, "items": list(devices), "sel": sel, "hits": {},
+            "y": box[0] if box else 2, "x": box[1] if box else 1,
+        }
+
+    def choose_device(self, kind, dev):
+        if kind == "tx":
+            self.route_tx_ip = dev.ip
+        else:
+            self.route_rx_ip = dev.ip
+        self.cur_row = self.cur_col = 0
+        self.grid_scroll_row = self.grid_scroll_col = 0
+        self.dropdown = None
+        self.engine.set_routing(self.route_tx_ip, self.route_rx_ip)
+
+    def handle_dropdown_key(self, ch, devices):
+        dd = self.dropdown
+        if ch in (27, ord("q")):
+            self.dropdown = None
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            dd["sel"] = min(dd["sel"] + 1, max(0, len(dd["items"]) - 1))
+        elif ch in (curses.KEY_UP, ord("k")):
+            dd["sel"] = max(0, dd["sel"] - 1)
+        elif ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+            if dd["items"]:
+                self.choose_device(dd["kind"], dd["items"][dd["sel"]])
+        elif ch == curses.KEY_MOUSE:
+            self.handle_mouse(devices)
+        return True
+
+    def toggle_subscription(self, devices):
+        """Ask before writing. This is the one thing that changes a device."""
+        tx_dev = self._by_ip(devices, self.route_tx_ip)
+        rx_dev = self._by_ip(devices, self.route_rx_ip)
+        if not tx_dev or not rx_dev:
+            return
+        tx_list = tx_dev.tx_list or []
+        rx_list = rx_dev.rx_list or []
+        if not tx_list or not rx_list:
+            return
+        rc = rx_list[min(self.cur_row, len(rx_list) - 1)]
+        tc = tx_list[min(self.cur_col, len(tx_list) - 1)]
+        col_hit, _elsewhere = self._subscription_for(rc, tx_dev, tx_list)
+        engine = self.engine
+        rx_ip, rx_id = rx_dev.ip, rc["id"]
+
+        if col_hit == self.cur_col:
+            self.confirm = {
+                "text": "UNSUBSCRIBE %s Rx%d '%s' (currently %s@%s)?"
+                        % (rx_dev.display_name, rx_id, rc["label"],
+                           rc["tx_name"], rc["tx_host"] or "?"),
+                "action": lambda: engine.unsubscribe(rx_ip, rx_id),
+                "done": "unsubscribe sent to %s Rx%d" % (rx_dev.display_name, rx_id),
+            }
+        else:
+            tx_name = tc["name"]
+            tx_host = tx_dev.name or tx_dev.hostname or ""
+            # Say so when this overwrites an existing patch. A receive channel
+            # holds one subscription, so quietly replacing one is a way to take
+            # audio off air without meaning to.
+            verb = "SUBSCRIBE"
+            if rc["tx_name"]:
+                verb = "REPLACE %s@%s ON" % (rc["tx_name"], rc["tx_host"] or "?")
+            self.confirm = {
+                "text": "%s %s Rx%d '%s' <- '%s'@%s?"
+                        % (verb, rx_dev.display_name, rx_id, rc["label"], tx_name, tx_host),
+                "action": lambda: engine.subscribe(rx_ip, rx_id, tx_name, tx_host),
+                "done": "subscribe sent: %s Rx%d <- %s@%s"
+                        % (rx_dev.display_name, rx_id, tx_name, tx_host),
+            }
 
     def handle_mouse(self, devices):
         try:
@@ -368,7 +502,46 @@ class App:
         for ty, x0, x1, page in self.tab_hits:
             if y == ty and x0 <= x <= x1:
                 self.page = page
+                self.dropdown = None
                 return
+
+        # An open dropdown swallows the click: either it picks an entry or it
+        # closes, so a stray click never falls through to the grid underneath.
+        if self.dropdown:
+            idx = self.dropdown["hits"].get(y)
+            if idx is not None and self.dropdown["items"]:
+                self.choose_device(self.dropdown["kind"], self.dropdown["items"][idx])
+            else:
+                for sy, x0, x1, kind in self.selector_hits:
+                    if y == sy and x0 <= x <= x1 and kind != self.dropdown["kind"]:
+                        self.open_dropdown(kind, devices)
+                        return
+                self.dropdown = None
+            return
+
+        for sy, x0, x1, kind in self.selector_hits:
+            if y == sy and x0 <= x <= x1:
+                self.open_dropdown(kind, devices)
+                return
+
+        if self.page == 2 and self.grid_geom:
+            gx0, gy0, rows_vis, cols_vis = self.grid_geom
+            if gy0 <= y < gy0 + rows_vis:
+                row = self.grid_scroll_row + (y - gy0)
+                # The label column selects a row without touching the patch.
+                if x < gx0:
+                    self.cur_row = row
+                    return
+                col = self.grid_scroll_col + (x - gx0) // COL_PITCH
+                # Clicking the cell the cursor is already on is the commit
+                # gesture -- so a first click always just aims, and patching a
+                # device is never one stray click away.
+                if (row, col) == (self.cur_row, self.cur_col):
+                    self.toggle_subscription(devices)
+                else:
+                    self.cur_row, self.cur_col = row, col
+            return
+
         if y in self.row_hits:
             self.sel = self.row_hits[y]
 
@@ -384,6 +557,21 @@ class App:
             self.sel = 0
 
         self.draw_header(w, len(devices))
+
+        if self.page == 2:
+            self.draw_routing(2, h, w, devices)
+            if self.dropdown:
+                self.draw_dropdown(devices, w, h)
+            if self.show_log:
+                self.draw_log(w, h)
+            self.draw_footer(h, w)
+            if self.confirm:
+                self.draw_confirm(w, h)
+            self.stdscr.refresh()
+            return
+
+        self.row_hits = {}
+        self.grid_geom = None
         table = DISCOVER if self.page == 0 else SYNC
 
         detail_h = 7
@@ -556,6 +744,219 @@ class App:
             self.put(yy, 1, "no heartbeat yet -- device is not announcing on %s:%d"
                      % (proto.GRP_HEARTBEAT, proto.PORT_HEARTBEAT), self.attr(C_DIM))
 
+    # -- routing page -----------------------------------------------------
+
+    @staticmethod
+    def _by_ip(devices, ip):
+        for d in devices:
+            if d.ip == ip:
+                return d
+        return None
+
+    def _route_defaults(self, devices):
+        """Pick a sensible pair the first time the page is opened."""
+        if self.route_tx_ip is None:
+            for d in devices:
+                if d.tx_channels:
+                    self.route_tx_ip = d.ip
+                    break
+        if self.route_rx_ip is None:
+            for d in devices:
+                if d.rx_channels and d.ip != self.route_tx_ip:
+                    self.route_rx_ip = d.ip
+                    break
+            else:
+                for d in devices:
+                    if d.rx_channels:
+                        self.route_rx_ip = d.ip
+                        break
+
+    @staticmethod
+    def _subscription_for(rx_chan, tx_dev, tx_list):
+        """Which column of this grid, if any, a receive channel is patched to.
+
+        A receive channel can be subscribed to a device that is not the one
+        selected as the transmitter. That is not a grid cell -- it belongs in
+        the row's annotation instead, or the grid would silently imply the
+        channel is free.
+        """
+        name = rx_chan.get("tx_name")
+        host = (rx_chan.get("tx_host") or "").lower()
+        if not name:
+            return None, False
+        mine = {(tx_dev.name or "").lower(), (tx_dev.hostname or "").lower()}
+        mine.discard("")
+        if host and host not in mine:
+            return None, True          # patched, but to some other device
+        for col, tx in enumerate(tx_list):
+            if tx["name"] == name:
+                return col, False
+        return None, True              # patched to a channel we cannot see
+
+    def draw_routing(self, top, h, w, devices):
+        self._route_defaults(devices)
+        self.engine.set_routing(self.route_tx_ip, self.route_rx_ip)
+        tx_dev = self._by_ip(devices, self.route_tx_ip)
+        rx_dev = self._by_ip(devices, self.route_rx_ip)
+
+        # -- the two select boxes ----------------------------------------
+        self.selector_hits = []
+        y = top
+        x = 1
+        for kind, dev, label in (("tx", tx_dev, "Transmitter"), ("rx", rx_dev, "Receiver")):
+            self.put(y, x, label + " ", self.attr(C_DIM))
+            x += len(label) + 1
+            name = dev.display_name if dev else "(none)"
+            box = "[ %-24s ▾ ]" % name[:24]
+            attr = self.attr(C_ACCENT, bold=True)
+            if self.dropdown and self.dropdown["kind"] == kind:
+                attr |= curses.A_REVERSE
+            elif self.mouse:
+                attr |= curses.A_UNDERLINE
+            self.put(y, x, box, attr)
+            self.selector_hits.append((y, x, x + len(box) - 1, kind))
+            x += len(box) + 4
+
+        tx_list = (tx_dev.tx_list if tx_dev else None) or []
+        rx_list = (rx_dev.rx_list if rx_dev else None) or []
+
+        # The legend lives on the row below the boxes, not beside them: the two
+        # selectors already reach past column 88 on a 140-column terminal.
+        legend = "%s active   %s unresolved   %s free   → patched to another device" % (
+            CELL_ACTIVE, CELL_UNRESOLVED, CELL_EMPTY)
+        info_y = y + 1
+        self.put(info_y, max(0, w - len(legend) - 2), legend, self.attr(C_DIM))
+
+        # -- status / loading --------------------------------------------
+        if not tx_dev or not rx_dev:
+            self.put(info_y + 1, 2, "select a transmitter and a receiver "
+                                    "(click a box, or press s / d)", self.attr(C_DIM))
+            self.grid_geom = None
+            return
+        err = tx_dev.chan_error or rx_dev.chan_error
+        if not tx_list or not rx_list:
+            msg = "reading channel lists from %s and %s ..." % (
+                tx_dev.display_name, rx_dev.display_name)
+            if err:
+                msg = "channel list unavailable: %s" % err
+            elif tx_dev.tx_list is not None and not tx_list:
+                msg = "%s advertises no transmit channels" % tx_dev.display_name
+            elif rx_dev.rx_list is not None and not rx_list:
+                msg = "%s advertises no receive channels" % rx_dev.display_name
+            self.put(info_y + 1, 2, msg, self.attr(C_WARN if err else C_DIM))
+            self.grid_geom = None
+            return
+
+        self.cur_col = max(0, min(self.cur_col, len(tx_list) - 1))
+        self.cur_row = max(0, min(self.cur_row, len(rx_list) - 1))
+
+        self.put(info_y, 2, "%d transmit × %d receive" % (len(tx_list), len(rx_list)),
+                 self.attr(C_DIM))
+
+        # -- geometry -----------------------------------------------------
+        hdr_y = info_y + 2                     # two rows of vertical numbering
+        grid_y0 = hdr_y + 2
+        grid_x0 = LABEL_W + 1
+        bottom = h - 3                          # leave the detail + footer rows
+        rows_vis = max(1, bottom - grid_y0)
+        cols_vis = max(1, (w - grid_x0 - 1) // COL_PITCH)
+
+        if self.cur_row < self.grid_scroll_row:
+            self.grid_scroll_row = self.cur_row
+        elif self.cur_row >= self.grid_scroll_row + rows_vis:
+            self.grid_scroll_row = self.cur_row - rows_vis + 1
+        if self.cur_col < self.grid_scroll_col:
+            self.grid_scroll_col = self.cur_col
+        elif self.cur_col >= self.grid_scroll_col + cols_vis:
+            self.grid_scroll_col = self.cur_col - cols_vis + 1
+        self.grid_scroll_row = max(0, min(self.grid_scroll_row, max(0, len(rx_list) - rows_vis)))
+        self.grid_scroll_col = max(0, min(self.grid_scroll_col, max(0, len(tx_list) - cols_vis)))
+        self.grid_geom = (grid_x0, grid_y0, rows_vis, cols_vis)
+
+        # -- column header: transmit channel numbers, written vertically ---
+        self.put(hdr_y, 1, ("%-*s" % (LABEL_W - 1, tx_dev.display_name[:LABEL_W - 1])),
+                 self.attr(C_ACCENT))
+        self.put(hdr_y + 1, 1, "%-*s" % (LABEL_W - 1, "TX →  /  RX ↓"), self.attr(C_DIM))
+        for j in range(cols_vis):
+            col = self.grid_scroll_col + j
+            if col >= len(tx_list):
+                break
+            num = tx_list[col]["id"]
+            cx = grid_x0 + j * COL_PITCH
+            attr = self.attr(C_ACCENT, bold=True) if col == self.cur_col else self.attr(C_DIM)
+            self.put(hdr_y, cx, str(num // 10 % 10) if num >= 10 else " ", attr)
+            self.put(hdr_y + 1, cx, str(num % 10), attr)
+
+        # -- rows ----------------------------------------------------------
+        for i in range(rows_vis):
+            row = self.grid_scroll_row + i
+            if row >= len(rx_list):
+                break
+            rc = rx_list[row]
+            ry = grid_y0 + i
+            col_hit, elsewhere = self._subscription_for(rc, tx_dev, tx_list)
+            mark = "→" if elsewhere else " "
+            label = "%2d %s%s" % (rc["id"], mark, rc["label"])
+            lattr = self.attr(C_SEL) if row == self.cur_row else 0
+            if row == self.cur_row:
+                self.put(ry, 0, " " * LABEL_W, lattr)
+            self.put(ry, 0, label[:LABEL_W], lattr)
+            for j in range(cols_vis):
+                col = self.grid_scroll_col + j
+                if col >= len(tx_list):
+                    break
+                cx = grid_x0 + j * COL_PITCH
+                if col == col_hit:
+                    glyph = CELL_ACTIVE if rc["active"] else CELL_UNRESOLVED
+                    cattr = self.attr(C_GOOD if rc["active"] else C_WARN, bold=True)
+                else:
+                    glyph = CELL_EMPTY
+                    cattr = self.attr(C_DIM)
+                if row == self.cur_row and col == self.cur_col:
+                    cattr = self.attr(C_SEL) | curses.A_BOLD
+                self.put(ry, cx, glyph, cattr)
+
+        # -- what the cursor is on ----------------------------------------
+        rc = rx_list[self.cur_row]
+        tc = tx_list[self.cur_col]
+        col_hit, elsewhere = self._subscription_for(rc, tx_dev, tx_list)
+        if rc["tx_name"]:
+            state = "active" if rc["active"] else ("unresolved" if rc["unresolved"]
+                                                   else "0x%08x" % rc["status"])
+            current = "%s@%s (%s)" % (rc["tx_name"], rc["tx_host"] or "?", state)
+        else:
+            current = "not subscribed"
+        detail = "Rx %s '%s'  ←  %s        cursor: Tx '%s' on %s" % (
+            rc["id"], rc["label"], current, tc["name"], tx_dev.display_name)
+        self.put(h - 2, 1, detail[:w - 2], self.attr(C_DIM))
+
+    def draw_dropdown(self, devices, w, h):
+        """Device chooser hanging under whichever select box is open."""
+        dd = self.dropdown
+        items = dd["items"]
+        y0 = dd["y"] + 1
+        width = max(28, min(46, w - dd["x"] - 2))
+        dd["hits"] = {}
+        for i, dev in enumerate(items):
+            y = y0 + i
+            if y >= h - 2:
+                break
+            tag = "%s  tx %s / rx %s" % (
+                dev.display_name[:24],
+                "?" if dev.tx_channels is None else dev.tx_channels,
+                "?" if dev.rx_channels is None else dev.rx_channels)
+            attr = self.attr(C_SEL) if i == dd["sel"] else self.attr(C_ACCENT)
+            self.put(y, dd["x"], " " + tag.ljust(width - 2), attr)
+            dd["hits"][y] = i
+        if not items:
+            self.put(y0, dd["x"], " no devices ".ljust(width), self.attr(C_DIM))
+
+    def draw_confirm(self, w, h):
+        c = self.confirm
+        self.put(h - 1, 0, " " * w, self.attr(C_WARN) | curses.A_REVERSE)
+        text = " %s   [y] yes   [any other key] cancel " % c["text"]
+        self.put(h - 1, 0, text[:w], self.attr(C_WARN) | curses.A_REVERSE | curses.A_BOLD)
+
     def draw_log(self, w, h):
         entries = list(self.engine.log)[-(h // 2):]
         errs = self.engine.socket_errors
@@ -578,9 +979,15 @@ class App:
             self.put(h - 1, 0, " " * w, self.attr(C_HEAD))
             self.put(h - 1, 1, self.status[:w - 2], self.attr(C_HEAD, bold=True))
             return
-        keys = " q quit   tab/1/2 page   ↑↓ select   r refresh   a passive   l log "
-        if self.mouse:
-            keys += "  click tab/row · shift+drag to select text "
+        if self.page == 2:
+            keys = (" q quit   tab/1/2/3 page   s/d device   ↑↓←→ cell   "
+                    "enter patch   r refresh   L log ")
+            if self.mouse:
+                keys += "  click box/cell, click again to patch "
+        else:
+            keys = " q quit   tab/1/2/3 page   ↑↓ select   r refresh   a passive   L log "
+            if self.mouse:
+                keys += "  click tab/row · shift+drag to select text "
         counters = "mdns %d  info %d  hb %d  arc %d  ptp %d  tx %d" % (
             st["mdns_rx"], st["info_rx"], st["hb_rx"], st["arc_rx"], st["ptp_rx"], st["tx"])
         self.put(h - 1, 0, " " * w, self.attr(C_HEAD))

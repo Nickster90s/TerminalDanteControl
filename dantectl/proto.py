@@ -55,6 +55,15 @@ OP_GET_DEVICE_NAME = 0x1002
 OP_GET_DEVICE_NAMES = 0x1003
 OP_GET_TX_CHANNELS = 0x2000
 OP_GET_RX_CHANNELS = 0x3000
+OP_SET_SUBSCRIPTIONS = 0x3010
+
+# Subscription status, from the u32 at offset 12 of a receive-channel item.
+# 0x01010009 is a resolved, running subscription; 0x00000001 means the device
+# remembers a subscription whose transmitter it cannot currently find (a
+# RedNet A16R on the bench reports exactly this for channels pointed at a
+# Yamaha QL1 that is powered off).
+SUB_ACTIVE = 0x01010009
+SUB_UNRESOLVED = 0x00000001
 
 
 def arc_request(opcode, seq, content=b"", start_code=ARC_START_CODE):
@@ -151,6 +160,101 @@ def parse_channel_counts(msg):
         "max_rx_flows": vals[6],
         "total_channels": vals[7],
     }
+
+
+# --------------------------------------------------------------------------
+# Channel lists (the routing grid)
+# --------------------------------------------------------------------------
+
+def channels_request(opcode, seq, start=1):
+    """Ask for a page of channels beginning at `start` (1-based).
+
+    The argument block is SIX bytes and the first word must be 1. This was not
+    guessable from the firmware, which defaults the start index whenever the
+    content is short and so accepts anything: real hardware does not. A RedNet
+    A16R rejects an empty request, a 2-byte request, both 4-byte forms and an
+    8-byte form with code 0x0022, and rejects `0000 ...` with 0x0023. Only
+    `0001 <start> 0000` is answered. Swept against the device to find it.
+    """
+    return arc_request(opcode, seq, struct.pack(">HHH", 1, start, 0))
+
+
+def _page_items(msg, item_size):
+    """Paged list responses: u8 space, u8 actual, then `actual` fixed items.
+
+    Returns (items, more). `more` means the device has further channels and
+    wants another request with a higher start index -- opcode2 0x8112.
+    """
+    c = msg["content"]
+    if len(c) < 2:
+        return [], False
+    actual = c[1]
+    items = []
+    for i in range(actual):
+        off = 2 + i * item_size
+        if off + item_size > len(c):
+            break
+        items.append(c[off:off + item_size])
+    return items, msg["more"]
+
+
+def parse_tx_channels(msg):
+    """0x2000 -- transmit channels. 8-byte items: id, 7, common offset, name."""
+    raw = msg["raw"]
+    out = []
+    items, more = _page_items(msg, 8)
+    for item in items:
+        cid, _unk, _common, name_off = struct.unpack(">HHHH", item)
+        out.append({"id": cid, "name": _cstr_at(raw, name_off) or str(cid)})
+    return out, more
+
+
+def parse_rx_channels(msg):
+    """0x3000 -- receive channels, 20-byte items.
+
+      0  channel_id            6  tx_channel_name_offset
+      2  unknown (6)           8  tx_hostname_offset
+      4  common_desc_offset   10  friendly_name_offset
+     12  subscription_status u32
+    """
+    raw = msg["raw"]
+    out = []
+    items, more = _page_items(msg, 20)
+    for item in items:
+        cid, _unk, _common, tx_off, host_off, label_off, status = struct.unpack(
+            ">HHHHHHI", item[:16])
+        out.append({
+            "id": cid,
+            "label": _cstr_at(raw, label_off) or str(cid),
+            "tx_name": _cstr_at(raw, tx_off),
+            "tx_host": _cstr_at(raw, host_off),
+            "status": status,
+            "active": status == SUB_ACTIVE,
+            "unresolved": status == SUB_UNRESOLVED,
+        })
+    return out, more
+
+
+def subscribe_request(seq, rx_channel_id, tx_name="", tx_host=""):
+    """0x3010 -- point a receive channel at a transmitter, or clear it.
+
+    Content, captured from Dante Controller patching a RedNet A16R:
+
+        0201 <rx_ch> <name_off> <host_off> then the two NUL-terminated strings
+
+    0x0201 is fixed in every request seen. Both offsets are ABSOLUTE from the
+    start of the packet, so they include the 10-byte header. An EMPTY transmit
+    channel name is how Dante Controller clears a patch, so unsubscribe is the
+    same message with empty strings rather than a separate opcode.
+    """
+    name = tx_name.encode("utf-8")[:31]
+    host = tx_host.encode("utf-8")[:31]
+    fixed = 8
+    name_off = ARC_HDR_LEN + fixed
+    host_off = name_off + len(name) + 1
+    content = (struct.pack(">HHHH", 0x0201, rx_channel_id, name_off, host_off)
+               + name + b"\x00" + host + b"\x00")
+    return arc_request(OP_SET_SUBSCRIPTIONS, seq, content)
 
 
 # --------------------------------------------------------------------------

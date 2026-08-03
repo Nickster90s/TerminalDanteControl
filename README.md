@@ -16,8 +16,8 @@ cd TerminalDanteControl
 
 `python3 -m dantectl` is equivalent. Requires Python 3.8+ on Linux.
 
-Keys: `1`/`2`/`Tab` page · `↑↓`/`jk` select · `r` refresh · `a` passive ·
-`l` log · `q` quit. Click the header tabs or a device row with the mouse;
+Keys: `1`/`2`/`3`/`Tab` page · `↑↓`/`jk` select · `r` refresh · `a` passive ·
+`L` log · `q` quit. Click the header tabs or a device row with the mouse;
 the wheel moves through the list.
 
 ```
@@ -37,10 +37,15 @@ the wheel moves through the list.
 
 ## What it does, and does not
 
-It **browses, listens and asks**. It never advertises a device of its own, never
-writes to a device, and never touches routing — so it cannot disturb a live
-network the way a second controller announcing itself would. Subscriptions,
-renames and flow creation are out of scope by design.
+It **browses, listens and asks**, and it never advertises a device of its own —
+so it cannot disturb a live network the way a second controller announcing
+itself would.
+
+**One thing writes: the Routing page.** Patching a receive channel sends
+`0x3010` to that device, and that changes it. Nothing else in the tool sends a
+write, and no write happens without an explicit confirmation keystroke — a
+click aims, it never patches. `--passive` blocks writes entirely, as does
+pressing `a`. Renames and flow creation are still out of scope.
 
 Interface choice is deliberate: an explicit `-i` always wins, otherwise it
 prefers a **link-local 169.254/16** address (what an un-DHCPed Dante network
@@ -123,6 +128,44 @@ Nothing in the UI claims more than the wire supports. Where a field's meaning is
 unestablished it is shown raw (`clock words 0003 0003`) rather than decoded into
 a confident guess.
 
+## Routing
+
+A patchbay for one pair of devices: pick a transmitter and a receiver in the two
+select boxes, and the grid below is **transmit channels across the top, receive
+channels down the left**, sized by what those two devices actually advertise.
+
+```
+ Transmitter [ N-Series-Switchover      ▾ ]    Receiver [ RedNetA16R               ▾ ]
+  48 transmit × 18 receive
+
+ N-Series-Switchover                   1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3
+ TX →  /  RX ↓       1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ 1  01               ● · · · · · · · · · · · · · · · · · · · · · · · · · · · · · ·
+ 2  02               · ● · · · · · · · · · · · · · · · · · · · · · · · · · · · · ·
+ 3 →03               · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · ·
+```
+
+| Glyph | Meaning |
+|---|---|
+| `●` | subscribed and resolved — status `0x01010009` |
+| `○` | subscribed but the transmitter cannot be found — status `0x00000001` |
+| `·` | free |
+| `→` on the row label | that receive channel is patched to a device other than the selected transmitter, so it has no cell in this grid |
+
+Keys: `s` and `d` open the transmitter and receiver choosers, arrows or `hjkl`
+move the cell cursor, `Enter` patches. With the mouse: click a box to open its
+chooser, click a cell to aim, **click the same cell again to patch**.
+
+**Every patch asks first.** A click only moves the cursor; the write needs a
+second click or `Enter`, and then a `y` at the confirmation bar. Anything else
+cancels. If the target channel already holds a subscription the prompt says
+`REPLACE <existing> ON ...` rather than `SUBSCRIBE`, because a receive channel
+holds exactly one subscription and silently overwriting one is a way to take
+audio off air without meaning to.
+
+Channel lists are read only for the two selected devices, and re-read every 6 s
+so the grid reflects what the devices say rather than what was asked for.
+
 ---
 
 ## Findings from the bench
@@ -143,7 +186,15 @@ implementation puts mean path delay, the AM2 puts something that climbs by
 It is displayed as reported, but do not read a foreign device's value as
 nanoseconds without checking that it moves like one.
 
-**3. Some devices drop control requests that arrive in a burst.** Measured, and
+**3. The channel-list request needs a six-byte argument block, first word 1.**
+The firmware this was written against defaults the start index whenever the
+content is short, so it accepts anything — real hardware does not. A RedNet A16R
+rejects an empty request, a 2-byte one, both 4-byte forms and an 8-byte form
+with code `0x0022`, and rejects a leading `0000` with `0x0023`. Only
+`0001 <start> 0000` is answered. Found by sweeping the request shape against the
+device; `channels_request()` carries the result.
+
+**4. Some devices drop control requests that arrive in a burst.** Measured, and
 the reason this tool paces itself:
 
 | target | ARC alone, 1.6 Hz | ARC + 4 info queries in the same burst |
@@ -170,7 +221,7 @@ exponential backoff to 60 s rather than waiting a full poll interval.
 | `dantectl/mdns.py` | minimal one-shot mDNS: DNS codec with compression, `_netaudio-*` browse and resolve |
 | `dantectl/proto.py` | ARC/CMC 10-byte framing and the 32-byte info framing, with each parser's provenance in comments |
 | `dantectl/engine.py` | one background thread: sockets, poll schedule, device registry |
-| `dantectl/ui.py` | the two curses pages, mouse handling |
+| `dantectl/ui.py` | the three curses pages, the routing grid, mouse handling |
 | `dantectl/__main__.py` | argument parsing, `--list` / `--json` modes |
 
 `proto.py` is the piece worth reading first: it documents both framings and the
@@ -204,10 +255,12 @@ Capturing the mouse means the terminal's own text selection needs **shift+drag**
 
 ## Known gaps
 
-- Channel-level browsing (`_netaudio-chan` / `_netaudio-bund`) is not
-  implemented; only device-level services are browsed.
-- Routing/subscription state (ARC `0x3000` receive channels) is not read, so
-  there is no patchbay view.
+- Channel-level mDNS browsing (`_netaudio-chan` / `_netaudio-bund`) is not
+  implemented; only device-level services are browsed. Channel names come from
+  ARC instead.
+- The routing grid covers one device pair at a time. There is no all-devices
+  matrix, and no flow view (`0x2200`/`0x3200`) behind the subscriptions.
+- Multicast transmit flows cannot be created or deleted (`0x2201`/`0x2202`).
 - The PTPv1 sniffer needs root (ports 319/320). Without it, a device that does
   not answer clock stats shows no PTP role and no grandmaster.
 - `word0` of the clock-stats payload (3 on a follower, 2 on the A16R while

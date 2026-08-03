@@ -45,6 +45,7 @@ SYNC_OFFSET_NS = 100_000
 RETRY_BASE = 4.0           # seconds before re-asking an unanswered question
 RETRY_MAX = 60.0
 DEVICE_COOLDOWN = 1.0      # minimum gap between two requests to the same device
+CHANNEL_INTERVAL = 6.0     # re-read the routing grid's channel lists this often
 
 
 def retry_delay(misses):
@@ -62,6 +63,8 @@ class Device:
         "last_arc", "arc_error", "is_self", "next_info", "next_clock", "next_arc",
         "sent_info", "sent_clock", "sent_arc", "miss_info", "miss_clock", "miss_arc",
         "last_heartbeat", "last_tx", "ptp_role", "ptp_leader_mac",
+        "tx_list", "rx_list", "_tx_acc", "_rx_acc", "chan_error",
+        "next_chan_tx", "next_chan_rx",
     )
 
     def __init__(self, ip):
@@ -119,6 +122,18 @@ class Device:
         # that never report a role themselves.
         self.ptp_role = None
         self.ptp_leader_mac = None
+        # Channel lists for the routing grid. Fetched only for the two devices
+        # the Routing page has selected -- pulling every channel of every
+        # device on a large network would be a lot of traffic for a view
+        # nobody is looking at. Pages accumulate in _tx_acc/_rx_acc and are
+        # swapped in whole, so the grid never renders a half-loaded list.
+        self.tx_list = None
+        self.rx_list = None
+        self._tx_acc = None
+        self._rx_acc = None
+        self.next_chan_tx = 0.0
+        self.next_chan_rx = 0.0
+        self.chan_error = None
 
     # -- derived ----------------------------------------------------------
 
@@ -212,6 +227,9 @@ class Engine:
         self.socket_errors = []
 
         self._seq = 0x1000
+        # IPs of the two devices the Routing page is showing, if any.
+        self.route_tx_ip = None
+        self.route_rx_ip = None
         self._stop = threading.Event()
         self._thread = None
         self._next_browse = 0.0
@@ -521,6 +539,10 @@ class Engine:
             dev.next_arc = dev.last_arc + self.arc_interval
             if not msg["ok"]:
                 dev.arc_error = "opcode 0x%04x -> code 0x%04x" % (msg["opcode1"], msg["opcode2"])
+                if msg["opcode1"] in (proto.OP_GET_TX_CHANNELS, proto.OP_GET_RX_CHANNELS,
+                                      proto.OP_SET_SUBSCRIPTIONS):
+                    dev.chan_error = dev.arc_error
+                    dev._tx_acc = dev._rx_acc = None
                 return
             dev.arc_error = None
             if msg["opcode1"] == proto.OP_GET_DEVICE_NAMES:
@@ -531,6 +553,33 @@ class Engine:
                 dev.revision = names.get("revision") or dev.revision
             elif msg["opcode1"] == proto.OP_GET_DEVICE_NAME:
                 dev.name = parse_or(proto.parse_device_name(msg), dev.name)
+            elif msg["opcode1"] == proto.OP_GET_TX_CHANNELS:
+                items, more = proto.parse_tx_channels(msg)
+                dev._tx_acc = (dev._tx_acc or []) + items
+                if more and items:
+                    # Ask for the rest, starting one past the last id we got.
+                    self._send("arc", proto.channels_request(
+                        proto.OP_GET_TX_CHANNELS, self._next_seq(),
+                        items[-1]["id"] + 1), (dev.ip, proto.PORT_ARC))
+                else:
+                    dev.tx_list = dev._tx_acc
+                    dev._tx_acc = None
+            elif msg["opcode1"] == proto.OP_GET_RX_CHANNELS:
+                items, more = proto.parse_rx_channels(msg)
+                dev._rx_acc = (dev._rx_acc or []) + items
+                if more and items:
+                    self._send("arc", proto.channels_request(
+                        proto.OP_GET_RX_CHANNELS, self._next_seq(),
+                        items[-1]["id"] + 1), (dev.ip, proto.PORT_ARC))
+                else:
+                    dev.rx_list = dev._rx_acc
+                    dev._rx_acc = None
+            elif msg["opcode1"] == proto.OP_SET_SUBSCRIPTIONS:
+                # The device acknowledges the patch but does not echo the new
+                # state, so re-read the receive channels to show what actually
+                # took rather than what we asked for.
+                dev.next_chan_rx = 0.0
+                self._note("%s accepted subscription change" % dev.ip)
             elif msg["opcode1"] == proto.OP_CHANNEL_COUNTS:
                 counts = proto.parse_channel_counts(msg)
                 for attr in ("tx_channels", "rx_channels", "max_channels_in_flow",
@@ -620,6 +669,51 @@ class Engine:
         for q in queries:
             self._send("info", proto.info_request(q, self._next_seq()), (ip, proto.PORT_INFO_REQ))
 
+    # -- routing ----------------------------------------------------------
+
+    def set_routing(self, tx_ip, rx_ip):
+        """Tell the engine which two devices the routing grid is showing."""
+        with self.lock:
+            changed = (tx_ip, rx_ip) != (self.route_tx_ip, self.route_rx_ip)
+            self.route_tx_ip, self.route_rx_ip = tx_ip, rx_ip
+            if changed:
+                for ip in (tx_ip, rx_ip):
+                    dev = self.devices.get(ip) if ip else None
+                    if dev:
+                        dev.next_chan_tx = dev.next_chan_rx = 0.0
+                        dev.chan_error = None
+
+    def refresh_channels(self):
+        with self.lock:
+            for ip in (self.route_tx_ip, self.route_rx_ip):
+                dev = self.devices.get(ip) if ip else None
+                if dev:
+                    dev.next_chan_tx = dev.next_chan_rx = 0.0
+                    dev.chan_error = None
+
+    def subscribe(self, rx_ip, rx_channel_id, tx_name, tx_host):
+        """Point one receive channel at a transmit channel. A WRITE.
+
+        This is the only message dantectl sends that changes a device. Passive
+        mode blocks it like everything else.
+        """
+        if self.passive:
+            return False
+        self._send("arc", proto.subscribe_request(self._next_seq(), rx_channel_id,
+                                                  tx_name, tx_host),
+                   (rx_ip, proto.PORT_ARC))
+        self._note("subscribe %s ch%d <- %s@%s" % (rx_ip, rx_channel_id, tx_name, tx_host))
+        return True
+
+    def unsubscribe(self, rx_ip, rx_channel_id):
+        """Clear a receive channel: the same opcode with an empty name."""
+        if self.passive:
+            return False
+        self._send("arc", proto.subscribe_request(self._next_seq(), rx_channel_id, "", ""),
+                   (rx_ip, proto.PORT_ARC))
+        self._note("unsubscribe %s ch%d" % (rx_ip, rx_channel_id))
+        return True
+
     def refresh(self):
         """What the Refresh button does in Dante Controller: re-browse and
         re-ask everything, right now."""
@@ -667,6 +761,33 @@ class Engine:
         # replies from it while both RedNets answered, and the same requests
         # sent one at a time all succeeded. Assume any small device has a
         # shallow receive path and spread the load.
+        # Channel lists first: if the routing grid is open it is what the user
+        # is looking at, and the only view that goes stale in a way they would
+        # act on. Two separate jobs, because the same device can legitimately
+        # be both ends of the grid and then needs both lists.
+        jobs = []
+        if self.route_tx_ip:
+            jobs.append((self.route_tx_ip, proto.OP_GET_TX_CHANNELS, "tx"))
+        if self.route_rx_ip:
+            jobs.append((self.route_rx_ip, proto.OP_GET_RX_CHANNELS, "rx"))
+        for ip, opcode, kind in jobs:
+            dev = self.devices.get(ip)
+            if dev is None or now - dev.last_tx < DEVICE_COOLDOWN:
+                continue
+            if now < (dev.next_chan_tx if kind == "tx" else dev.next_chan_rx):
+                continue
+            if kind == "tx":
+                dev._tx_acc = None
+                dev.next_chan_tx = now + CHANNEL_INTERVAL
+            else:
+                dev._rx_acc = None
+                dev.next_chan_rx = now + CHANNEL_INTERVAL
+            self._send("arc", proto.channels_request(opcode, self._next_seq(), 1),
+                       (ip, proto.PORT_ARC))
+            dev.last_tx = now
+            return                      # one channel fetch per tick, and
+                                        # nothing else to that device this tick
+
         budget = 1
         for dev in devices:
             if budget <= 0:
