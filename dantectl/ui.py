@@ -20,6 +20,8 @@ PAGES = ("Discover", "Sync", "Routing")
 CELL_ACTIVE = "●"
 CELL_UNRESOLVED = "○"
 CELL_EMPTY = "·"
+CELL_PENDING = "…"           # sent, not yet confirmed by a read-back
+PENDING_TIMEOUT = 12.0
 COL_PITCH = 2                # one glyph plus one space per transmit channel
 LABEL_W = 20                 # width of the receive-channel label column
 
@@ -290,6 +292,7 @@ class App:
         self.selector_hits = []     # (y, x0, x1, "tx"/"rx")
         self.dropdown = None        # open device chooser, if any
         self.confirm = None         # pending write, waiting for y/n
+        self.pending = None         # a patch we sent, not yet seen in a read-back
         self.mouse = enable_mouse() if mouse_enabled else False
         curses.curs_set(0)
         stdscr.nodelay(True)
@@ -466,8 +469,10 @@ class App:
                 "text": "UNSUBSCRIBE %s Rx%d '%s' (currently %s@%s)?"
                         % (rx_dev.display_name, rx_id, rc["label"],
                            rc["tx_name"], rc["tx_host"] or "?"),
-                "action": lambda: engine.unsubscribe(rx_ip, rx_id),
-                "done": "unsubscribe sent to %s Rx%d" % (rx_dev.display_name, rx_id),
+                "action": lambda: self._write(engine.unsubscribe(rx_ip, rx_id),
+                                              rx_ip, rx_id, None),
+                "done": "unsubscribe sent to %s Rx%d -- reading back"
+                        % (rx_dev.display_name, rx_id),
             }
         else:
             tx_name = tc["name"]
@@ -481,10 +486,19 @@ class App:
             self.confirm = {
                 "text": "%s %s Rx%d '%s' <- '%s'@%s?"
                         % (verb, rx_dev.display_name, rx_id, rc["label"], tx_name, tx_host),
-                "action": lambda: engine.subscribe(rx_ip, rx_id, tx_name, tx_host),
-                "done": "subscribe sent: %s Rx%d <- %s@%s"
+                "action": lambda: self._write(
+                    engine.subscribe(rx_ip, rx_id, tx_name, tx_host),
+                    rx_ip, rx_id, tx_name),
+                "done": "subscribe sent: %s Rx%d <- %s@%s -- reading back"
                         % (rx_dev.display_name, rx_id, tx_name, tx_host),
             }
+
+    def _write(self, sent, rx_ip, rx_id, tx_name):
+        """Mark the cell in flight so the confirmation is visible immediately."""
+        if sent:
+            self.pending = {"rx_ip": rx_ip, "rx_id": rx_id, "tx_name": tx_name,
+                            "until": time.monotonic() + PENDING_TIMEOUT}
+        return sent
 
     def handle_mouse(self, devices):
         try:
@@ -793,6 +807,30 @@ class App:
                 return col, False
         return None, True              # patched to a channel we cannot see
 
+    def _pending_col(self, rx_dev, rx_chan, tx_list):
+        """Column to draw as in-flight, if a patch we sent is not visible yet.
+
+        The device is the authority: as soon as its read-back agrees with what
+        we asked for, the marker is dropped and the real state is drawn. It also
+        times out, so a device that silently ignores the write does not leave a
+        cell claiming forever that something is on its way.
+        """
+        p = self.pending
+        if not p or p["rx_ip"] != rx_dev.ip or p["rx_id"] != rx_chan["id"]:
+            return None
+        if time.monotonic() > p["until"]:
+            self.pending = None
+            return None
+        if rx_chan.get("tx_name") == p["tx_name"]:      # device agrees; done
+            self.pending = None
+            return None
+        if p["tx_name"] is None:                        # unsubscribe in flight
+            return None
+        for col, tx in enumerate(tx_list):
+            if tx["name"] == p["tx_name"]:
+                return col
+        return None
+
     def draw_routing(self, top, h, w, devices):
         self._route_defaults(devices)
         self.engine.set_routing(self.route_tx_ip, self.route_rx_ip)
@@ -895,6 +933,7 @@ class App:
             rc = rx_list[row]
             ry = grid_y0 + i
             col_hit, elsewhere = self._subscription_for(rc, tx_dev, tx_list)
+            pend_col = self._pending_col(rx_dev, rc, tx_list)
             mark = "→" if elsewhere else " "
             label = "%2d %s%s" % (rc["id"], mark, rc["label"])
             lattr = self.attr(C_SEL) if row == self.cur_row else 0
@@ -906,7 +945,10 @@ class App:
                 if col >= len(tx_list):
                     break
                 cx = grid_x0 + j * COL_PITCH
-                if col == col_hit:
+                if col == pend_col:
+                    glyph = CELL_PENDING
+                    cattr = self.attr(C_WARN, bold=True)
+                elif col == col_hit:
                     glyph = CELL_ACTIVE if rc["active"] else CELL_UNRESOLVED
                     cattr = self.attr(C_GOOD if rc["active"] else C_WARN, bold=True)
                 else:

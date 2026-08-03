@@ -150,6 +150,7 @@ channels down the left**, sized by what those two devices actually advertise.
 | `●` | subscribed and resolved — status `0x01010009` |
 | `○` | subscribed but the transmitter cannot be found — status `0x00000001` |
 | `·` | free |
+| `…` | the patch has been sent and the device has not reported it back yet |
 | `→` on the row label | that receive channel is patched to a device other than the selected transmitter, so it has no cell in this grid |
 
 Keys: `s` and `d` open the transmitter and receiver choosers, arrows or `hjkl`
@@ -165,6 +166,16 @@ audio off air without meaning to.
 
 Channel lists are read only for the two selected devices, and re-read every 6 s
 so the grid reflects what the devices say rather than what was asked for.
+
+**After a patch the read-back is driven by the write, not by the reply.** The
+cell shows `…` the moment the request goes out, the device's receive channels
+are re-read immediately and then once a second for 12 s, and the marker is
+replaced by whatever the device actually reports — usually inside half a second.
+Hanging this off the `0x3010` acknowledgement instead was wrong twice over: not
+every device sends one, and even where one arrives it says only that the request
+was received, while the subscription itself goes from unresolved to active a
+moment later. Without this the grid sat unchanged until the next 6 s poll, which
+reads as "the patch did not take".
 
 ---
 

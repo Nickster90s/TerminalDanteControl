@@ -46,6 +46,14 @@ RETRY_BASE = 4.0           # seconds before re-asking an unanswered question
 RETRY_MAX = 60.0
 DEVICE_COOLDOWN = 1.0      # minimum gap between two requests to the same device
 CHANNEL_INTERVAL = 6.0     # re-read the routing grid's channel lists this often
+# Just after a patch, read back faster and for a while. Two reasons: a device
+# that does not acknowledge 0x3010 gives us no other signal that anything
+# happened, and even one that does needs a moment -- the subscription appears as
+# unresolved first and only becomes active once the receiver has found the
+# transmitter and set up a flow. Waiting a full interval for either reads as
+# "the patch did not take".
+CHANNEL_BURST_INTERVAL = 1.0
+CHANNEL_BURST_SECS = 12.0
 
 
 def retry_delay(misses):
@@ -64,7 +72,7 @@ class Device:
         "sent_info", "sent_clock", "sent_arc", "miss_info", "miss_clock", "miss_arc",
         "last_heartbeat", "last_tx", "ptp_role", "ptp_leader_mac",
         "tx_list", "rx_list", "_tx_acc", "_rx_acc", "chan_error",
-        "next_chan_tx", "next_chan_rx",
+        "next_chan_tx", "next_chan_rx", "chan_burst_until",
     )
 
     def __init__(self, ip):
@@ -133,6 +141,7 @@ class Device:
         self._rx_acc = None
         self.next_chan_tx = 0.0
         self.next_chan_rx = 0.0
+        self.chan_burst_until = 0.0
         self.chan_error = None
 
     # -- derived ----------------------------------------------------------
@@ -703,7 +712,22 @@ class Engine:
                                                   tx_name, tx_host),
                    (rx_ip, proto.PORT_ARC))
         self._note("subscribe %s ch%d <- %s@%s" % (rx_ip, rx_channel_id, tx_name, tx_host))
+        self._read_back(rx_ip)
         return True
+
+    def _read_back(self, rx_ip):
+        """Re-read a device's receive channels right now, then keep checking.
+
+        Driven from the write itself rather than from the acknowledgement,
+        because not every device answers 0x3010 and the ack is not the point
+        anyway -- what the grid must show is what the device reports about
+        itself afterwards.
+        """
+        with self.lock:
+            dev = self.devices.get(rx_ip)
+            if dev:
+                dev.next_chan_rx = 0.0
+                dev.chan_burst_until = time.monotonic() + CHANNEL_BURST_SECS
 
     def unsubscribe(self, rx_ip, rx_channel_id):
         """Clear a receive channel: the same opcode with an empty name."""
@@ -712,6 +736,7 @@ class Engine:
         self._send("arc", proto.subscribe_request(self._next_seq(), rx_channel_id, "", ""),
                    (rx_ip, proto.PORT_ARC))
         self._note("unsubscribe %s ch%d" % (rx_ip, rx_channel_id))
+        self._read_back(rx_ip)
         return True
 
     def refresh(self):
@@ -776,12 +801,14 @@ class Engine:
                 continue
             if now < (dev.next_chan_tx if kind == "tx" else dev.next_chan_rx):
                 continue
+            interval = (CHANNEL_BURST_INTERVAL if now < dev.chan_burst_until
+                        else CHANNEL_INTERVAL)
             if kind == "tx":
                 dev._tx_acc = None
-                dev.next_chan_tx = now + CHANNEL_INTERVAL
+                dev.next_chan_tx = now + interval
             else:
                 dev._rx_acc = None
-                dev.next_chan_rx = now + CHANNEL_INTERVAL
+                dev.next_chan_rx = now + interval
             self._send("arc", proto.channels_request(opcode, self._next_seq(), 1),
                        (ip, proto.PORT_ARC))
             dev.last_tx = now
