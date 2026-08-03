@@ -61,7 +61,7 @@ class Device:
         "ppb_history", "first_seen", "last_seen", "last_info", "last_clock",
         "last_arc", "arc_error", "is_self", "next_info", "next_clock", "next_arc",
         "sent_info", "sent_clock", "sent_arc", "miss_info", "miss_clock", "miss_arc",
-        "last_heartbeat", "last_tx",
+        "last_heartbeat", "last_tx", "ptp_role", "ptp_leader_mac",
     )
 
     def __init__(self, ip):
@@ -115,6 +115,10 @@ class Device:
         self.miss_clock = 0
         self.miss_arc = 0
         self.last_tx = 0.0          # last request of any kind sent to this device
+        # Filled in by Engine.snapshot() from the PTPv1 sniffer, for devices
+        # that never report a role themselves.
+        self.ptp_role = None
+        self.ptp_leader_mac = None
 
     # -- derived ----------------------------------------------------------
 
@@ -275,21 +279,32 @@ class Engine:
 
         self.sockets["arc"] = net.udp_socket(self.ifaddr, 0)
 
-        # PTPv1 on port 320 is privileged. Without it the Sync page still works
-        # -- it just cannot show the elected grandmaster independently of what
-        # the devices claim.
+        # PTPv1, BOTH ports. 319 is the event port and carries Sync and
+        # Delay_Req; 320 is the general port and carries Follow_Up and
+        # Delay_Resp. Listening only on 320 -- which this did at first -- sees
+        # the leader's Follow_Ups and never a single Delay_Req, so no follower
+        # can be identified and the leader is only found by inference. Both
+        # ports are privileged, so this whole path needs root.
+        #
+        # It earns that root: a device that answers no clock stats at all still
+        # announces its role here. A RedNet AM2 emits Delay_Req and nothing
+        # else, which is a follower, stated by the device on the wire.
         if self.want_ptp:
-            try:
-                ptp = net.udp_socket("", proto.PTPV1_GENERAL_PORT, mcast_if=self.ifaddr)
-                net.join_group(ptp, proto.PTPV1_GROUP, self.ifaddr)
-                self.sockets["ptp"] = ptp
-                self.ptp_available = True
-            except OSError as e:
-                if e.errno in (errno.EACCES, errno.EPERM):
-                    self.socket_errors.append("PTPv1 sniff needs root (port 320); "
-                                              "grandmaster shown as reported by devices")
-                else:
-                    self.socket_errors.append("PTPv1 sniff unavailable (%s)" % e.strerror)
+            for port in (proto.PTPV1_EVENT_PORT, proto.PTPV1_GENERAL_PORT):
+                try:
+                    ptp = net.udp_socket("", port, mcast_if=self.ifaddr)
+                    net.join_group(ptp, proto.PTPV1_GROUP, self.ifaddr)
+                    self.sockets["ptp%d" % port] = ptp
+                    self.ptp_available = True
+                except OSError as e:
+                    if e.errno in (errno.EACCES, errno.EPERM):
+                        self.socket_errors.append(
+                            "PTPv1 sniff needs root (ports 319/320); without it, devices that "
+                            "do not answer clock stats show no PTP role -- run with sudo")
+                    else:
+                        self.socket_errors.append(
+                            "PTPv1 port %d unavailable (%s)" % (port, e.strerror))
+                    break
 
     # -- main loop --------------------------------------------------------
 
@@ -340,7 +355,7 @@ class Engine:
         elif which == "arc":
             self.stats["arc_rx"] += 1
             self._handle_arc(data, addr)
-        elif which == "ptp":
+        elif which and which.startswith("ptp"):
             self.stats["ptp_rx"] += 1
             self._handle_ptp(data, addr)
 
@@ -530,14 +545,43 @@ class Engine:
         if not p:
             return
         with self.lock:
-            entry = self.ptp.setdefault(p["source_uuid"], {"count": 0, "sync": 0})
+            entry = self.ptp.setdefault(p["source_uuid"], {
+                "count": 0, "sync": 0, "delay_req": 0, "leaderish": 0})
             entry["last"] = time.monotonic()
             entry["seq"] = p["sequence"]
             entry["subdomain"] = p["subdomain"]
             entry["count"] += 1
-            if p["control"] == proto.PTPV1_CTL_SYNC:
-                entry["sync"] += 1
             entry["src_ip"] = addr[0]
+            ctl = p["control"]
+            if ctl == proto.PTPV1_CTL_SYNC:
+                entry["sync"] += 1
+            # Sync, Follow_Up and Delay_Resp are all sent BY the leader;
+            # Delay_Req only ever by a follower. That asymmetry is the whole
+            # classification -- no election state or clock-stats reply needed.
+            if ctl in (proto.PTPV1_CTL_SYNC, proto.PTPV1_CTL_FOLLOWUP,
+                       proto.PTPV1_CTL_DELAY_RESP):
+                entry["leaderish"] += 1
+            elif ctl == proto.PTPV1_CTL_DELAY_REQ:
+                entry["delay_req"] += 1
+
+    def ptp_role(self, mac, max_age=60.0):
+        """LEADER / FOLLOWER for a MAC, from sniffed PTPv1, or None.
+
+        A device sending Sync/Follow_Up/Delay_Resp is leading; one sending only
+        Delay_Req is following. Both counters are checked because a device that
+        has just lost an election can have stale counts of the other kind.
+        """
+        if not mac:
+            return None
+        with self.lock:
+            entry = self.ptp.get(mac.lower())
+            if not entry or time.monotonic() - entry.get("last", 0) > max_age:
+                return None
+            if entry["leaderish"] > entry["delay_req"]:
+                return "LEADER"
+            if entry["delay_req"]:
+                return "FOLLOWER"
+            return None
 
     # -- transmit ---------------------------------------------------------
 
@@ -664,9 +708,16 @@ class Engine:
     # -- read side --------------------------------------------------------
 
     def snapshot(self):
+        leader = self.ptp_leader()
+        leader_mac = leader[0] if leader else None
         with self.lock:
             devs = sorted(self.devices.values(), key=lambda d: (d.display_name.lower(), d.ip))
-            return list(devs)
+        # Annotate here rather than in the UI so the tables stay simple lambdas
+        # over a device, and so --json gets the same derived values.
+        for dev in devs:
+            dev.ptp_role = self.ptp_role(dev.mac)
+            dev.ptp_leader_mac = leader_mac
+        return list(devs)
 
     def ptp_leader(self):
         """The MAC transmitting PTPv1 Sync, if we are allowed to sniff."""

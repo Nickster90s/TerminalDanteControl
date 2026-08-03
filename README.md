@@ -67,7 +67,12 @@ when you are bringing up a device's control plane.
 | clock stats reply `0x0020` (asked with `0x21`) | locked / not locked, PTP port state (Leader/Follower), grandmaster and parent clock ids, frequency offset |
 | heartbeat `224.0.0.233:8708`, sub-record `0x8001` | frequency offset in ppb — the number Dante Controller plots in its clock histogram |
 | heartbeat sub-record `0x8000` | offset from master, mean path delay |
-| PTPv1 `224.0.1.129:319/320` | who is actually transmitting Sync (needs root; optional) |
+| PTPv1 `224.0.1.129:319/320` | who leads and who follows, from the traffic itself (needs root) |
+
+Run it with `sudo` if you want roles for every device. Both PTP ports matter:
+319 (event) carries Sync and Delay_Req, 320 (general) carries Follow_Up and
+Delay_Resp. Listening only on 320 — which this did at first — sees the leader's
+Follow_Ups and never a single Delay_Req, so no follower can be identified.
 
 The detail pane draws a sparkline of the frequency offset over the last ~240
 heartbeats — the cheapest way to see a servo that is hunting or drifting.
@@ -83,6 +88,36 @@ heartbeats — the cheapest way to see a servo that is hunting or drifting.
   means nothing. The A16R keeps sending a `0x8000` record while it leads, with
   values around 455 µs that are not an offset from anything; the raw numbers are
   still shown in the detail pane.
+- `follower ~` / `leader ~` under PTP ROLE — the device never reported a role,
+  so it was classified from its PTPv1 traffic. See below.
+
+### Why a device can show no PTP role
+
+PTP ROLE normally comes from the device's clock-stats reply (`0x0020`), where
+offset 40 holds the IEEE 1588 port state — 9 FOLLOWER, 6 LEADER. **Some devices
+never send that message at all.** A RedNet AM2 is one: it answers `0x13`,
+`0x61` and `0xc1` within milliseconds and is silent on `0x21` across every
+variation tried — four opcode family bytes (`0x3e`/`0x38`/`0x32`/`0x2a`), both
+start codes, trailing byte `0x64` and `0x00`, request sourced from port 8700 and
+from 8702, all-zero and real `factory_device_id`, with and without content. Over
+45 s of passive listening it announced 45 heartbeats and three rounds of
+device/product/network info, and **zero** clock stats. The ARC property tables
+(`0x1100`/`0x1102`) do not carry the grandmaster id either, so they are not a
+back door to it.
+
+The role is still knowable, because PTP itself says so: Sync, Follow_Up and
+Delay_Resp are only ever sent *by* the leader, and Delay_Req only *by* a
+follower. On the bench, over 20 s:
+
+```
+00:1d:c1:2d:4a:18  Sync x81, Follow_Up x80, Delay_Resp x10   -> A16R, leader
+00:1d:c1:a1:72:3c  Delay_Req x5                              -> AM2,  follower
+02:00:00:00:00:42  Delay_Req x5                              -> FPGA, follower
+```
+
+So with root, the AM2 shows `follower ~` and the grandmaster column fills in
+from the wire. Without root that column stays `-`, because guessing would be
+worse than admitting we did not look.
 
 Nothing in the UI claims more than the wire supports. Where a field's meaning is
 unestablished it is shown raw (`clock words 0003 0003`) rather than decoded into
@@ -173,8 +208,8 @@ Capturing the mouse means the terminal's own text selection needs **shift+drag**
   implemented; only device-level services are browsed.
 - Routing/subscription state (ARC `0x3000` receive channels) is not read, so
   there is no patchbay view.
-- The PTPv1 sniffer needs root for port 320. Without it the grandmaster shown is
-  whatever devices report, which is normally the same answer.
+- The PTPv1 sniffer needs root (ports 319/320). Without it, a device that does
+  not answer clock stats shows no PTP role and no grandmaster.
 - `word0` of the clock-stats payload (3 on a follower, 2 on the A16R while
   leading) looks like a clock-source field but is displayed raw, not decoded.
 - Linux only: interface enumeration uses netlink and `/sys/class/net`.

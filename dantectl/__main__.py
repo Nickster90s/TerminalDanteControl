@@ -67,6 +67,8 @@ def device_dict(dev):
         "services": {k: v.get("port") for k, v in dev.services.items()},
         "txt": dev.txt,
         "sync": dev.sync_state,
+        "ptp_role_reported": dev.clock.get("port_state_name"),
+        "ptp_role_sniffed": dev.ptp_role,
         "is_leader": dev.is_leader,
         "offset_ns": dev.offset_ns,
         "path_delay_ns": dev.path_delay_ns,
@@ -92,8 +94,11 @@ def print_list(eng):
             (d.manufacturer or "-")[:9],
             "-" if d.tx_channels is None else d.tx_channels,
             "-" if d.rx_channels is None else d.rx_channels,
-            d.sync_state, d.clock.get("port_state_name", "-"),
-            d.clock.get("grandmaster_id") or "-",
+            d.sync_state,
+            d.clock.get("port_state_name") or
+            (d.ptp_role.lower() + "~" if d.ptp_role else "-"),
+            d.clock.get("grandmaster_id") or
+            ((d.ptp_leader_mac + "~") if d.ptp_leader_mac else "-"),
             ("n/a" if d.is_leader else "-") if offset is None else "%d ns" % offset,
             "-" if d.ppb is None else "%+d" % d.ppb))
     leader = eng.ptp_leader()

@@ -220,12 +220,31 @@ def _offset_cell(dev):
     return (fmt_ns(off), attr)
 
 
+def _role_cell(dev):
+    # The device's own clock-stats answer wins. Failing that, what it does on
+    # the PTP wire -- marked ~ because we inferred it rather than being told.
+    state = dev.clock.get("port_state_name")
+    if state:
+        return (state, C_ACCENT if dev.clock.get("port_state") == 6 else None)
+    if dev.ptp_role:
+        return (dev.ptp_role.lower() + " ~", C_ACCENT if dev.ptp_role == "LEADER" else None)
+    return ("-", C_DIM)
+
+
+def _gm_cell(dev):
+    gm = dev.clock.get("grandmaster_id")
+    if gm:
+        return gm
+    if dev.ptp_leader_mac:
+        return (dev.ptp_leader_mac + " ~", C_DIM)
+    return ("-", C_DIM)
+
+
 SYNC = Table([
     ("NAME", 22, lambda d: (d.display_name, C_ACCENT if d.name else None)),
     ("SYNC", 9, _sync_cell),
-    ("PTP ROLE", 12, lambda d: (d.clock.get("port_state_name", "-"),
-                                C_ACCENT if d.clock.get("port_state") == 6 else None)),
-    ("GRANDMASTER", 18, lambda d: d.clock.get("grandmaster_id") or "-"),
+    ("PTP ROLE", 12, _role_cell),
+    ("GRANDMASTER", 18, _gm_cell),
     ("OFFSET", 10, _offset_cell),
     ("PATH DELAY", 10, lambda d: (fmt_ns(d.path_delay_ns),
                                   C_DIM if d.path_delay_ns is None else None)),
