@@ -1,0 +1,35 @@
+dantectl — a terminal Dante controller
+Copyright 2026 Nick (nick.eventslight@gmail.com)
+
+Licensed under the Apache License, Version 2.0 — see LICENSE.
+
+All source code in this repository is original work. No third-party source
+is vendored here, and the only runtime dependency is the Python 3 standard
+library.
+
+------------------------------------------------------------------------
+Trademarks and protocol provenance
+
+This project is NOT affiliated with, authorized by, or approved by
+Audinate. "Dante" is a trademark of Audinate Pty Ltd.
+
+The Dante protocol is undocumented. The wire formats implemented here were
+derived from public reverse-engineering work — principally the Inferno
+project (https://gitlab.com/lumifaza/inferno) and network-audio-controller
+(https://github.com/chris-ritsen/network-audio-controller) — and confirmed
+against packet captures taken on the author's own bench.
+
+Those projects were read as a DESCRIPTION of wire formats, opcodes and
+record layouts. No code from either was copied into this repository.
+Inferno is licensed GPL-3.0-or-later / AGPL-3.0-or-later; that licence
+does not attach to this work, because no part of it is a derivative of
+Inferno's source.
+
+Audinate holds patents covering technology used by Dante. Consult a lawyer
+before distributing binaries in, or from, a jurisdiction where software
+patents apply, or before making commercial use of this code.
+
+Do not use this project to make counterfeit Dante devices. Always state
+that any implementation built on it is unofficial and not endorsed by
+Audinate.
+------------------------------------------------------------------------
