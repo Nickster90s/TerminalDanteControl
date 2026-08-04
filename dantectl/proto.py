@@ -271,6 +271,8 @@ Q_DEVICE_INFO = 0x61
 Q_PRODUCT_INFO = 0xC1
 Q_NETWORK_INFO = 0x13
 Q_CLOCK_STATS = 0x21
+Q_SAMPLE_RATES = 0x81
+Q_ENCODINGS = 0x83
 
 # Reply opcode byte [3]. Note network info replies 0x11 to a 0x13 request and
 # clock stats replies 0x20 to a 0x21 -- request and reply are not the same value.
@@ -278,6 +280,8 @@ R_DEVICE_INFO = 0x60
 R_PRODUCT_INFO = 0xC0
 R_NETWORK_INFO = 0x11
 R_CLOCK_STATS = 0x20
+R_SAMPLE_RATES = 0x80
+R_ENCODINGS = 0x82
 
 SC_HEARTBEAT = 0xFFFE
 SC_INFO = 0xFFFF
@@ -357,6 +361,33 @@ def parse_product_info(content):
         "model_name": _fixed_str(content, 0xAC, 16),
         "product_version": _ver(content, 0x1C),
     }
+
+
+def parse_capability_table(content):
+    """Replies 0x0080 (sample rates) and 0x0082 (encodings) share one shape:
+
+        0  2  item size, 0x18 on every device seen
+        2  2  count of entries in the list
+        4  4  current value
+        8  4  a second value -- 0 on the A16R and the FPGA, a copy of the
+              current value on the AM2, so not interpreted here
+       16  .. `count` big-endian u32 entries
+
+    Sizes check out exactly: the A16R's 40-byte rate table is 16 + 6 x 4 and
+    lists 44100/48000/88200/96000/176400/192000; its 20-byte encoding table is
+    16 + 1 x 4 and lists 24.
+    """
+    if len(content) < 16:
+        return {}
+    _item_size, count = struct.unpack(">HH", content[0:4])
+    current = struct.unpack(">I", content[4:8])[0]
+    values = []
+    for i in range(count):
+        off = 16 + i * 4
+        if off + 4 > len(content):
+            break
+        values.append(struct.unpack(">I", content[off:off + 4])[0])
+    return {"current": current, "supported": values}
 
 
 def parse_network_info(content):

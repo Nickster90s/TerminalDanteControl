@@ -54,6 +54,9 @@ CHANNEL_INTERVAL = 6.0     # re-read the routing grid's channel lists this often
 # "the patch did not take".
 CHANNEL_BURST_INTERVAL = 0.5
 CHANNEL_BURST_SECS = 12.0
+# Sample rate and encoding do not change under a running device; ask once
+# on discovery and then rarely.
+FORMAT_INTERVAL = 120.0
 
 
 def retry_delay(misses):
@@ -73,6 +76,8 @@ class Device:
         "last_heartbeat", "last_tx", "ptp_role", "ptp_leader_mac",
         "tx_list", "rx_list", "_tx_acc", "_rx_acc", "chan_error",
         "next_chan_tx", "next_chan_rx", "chan_burst_until",
+        "sample_rates", "encoding", "encodings", "aes67", "lockable",
+        "network_configurable", "next_fmt", "sent_fmt", "miss_fmt", "last_fmt",
     )
 
     def __init__(self, ip):
@@ -143,6 +148,19 @@ class Device:
         self.next_chan_rx = 0.0
         self.chan_burst_until = 0.0
         self.chan_error = None
+        # Formats and capabilities. Asked for separately and rarely: they do
+        # not change while a device is running, and every extra query in a
+        # poll round is another datagram for a small device to drop.
+        self.sample_rates = None    # every rate the device says it supports
+        self.encoding = None        # current bit depth
+        self.encodings = None
+        self.aes67 = None
+        self.lockable = None
+        self.network_configurable = None
+        self.next_fmt = 0.0
+        self.sent_fmt = 0.0
+        self.miss_fmt = 0
+        self.last_fmt = 0.0
 
     # -- derived ----------------------------------------------------------
 
@@ -548,7 +566,25 @@ class Engine:
                 dev.firmware_version = di.get("firmware_version") or dev.firmware_version
                 dev.hardware_version = di.get("hardware_version") or dev.hardware_version
                 dev.board_name = di.get("board_name_long") or di.get("board_name") or dev.board_name
+                if di:
+                    dev.aes67 = di.get("supports_aes67")
+                    dev.lockable = di.get("lockable")
+                    dev.network_configurable = di.get("network_configurable")
                 dev.last_info = time.monotonic()
+            elif q == proto.R_SAMPLE_RATES:
+                t = proto.parse_capability_table(content)
+                if t:
+                    dev.sample_rate = t["current"] or dev.sample_rate
+                    dev.sample_rates = t["supported"] or dev.sample_rates
+                    dev.last_fmt = time.monotonic()
+                    dev.miss_fmt = 0
+                    dev.next_fmt = dev.last_fmt + FORMAT_INTERVAL
+            elif q == proto.R_ENCODINGS:
+                t = proto.parse_capability_table(content)
+                if t:
+                    dev.encoding = t["current"] or dev.encoding
+                    dev.encodings = t["supported"] or dev.encodings
+                    dev.last_fmt = time.monotonic()
             elif q == proto.R_PRODUCT_INFO:
                 pi = proto.parse_product_info(content)
                 dev.manufacturer = pi.get("manufacturer") or dev.manufacturer
@@ -873,6 +909,14 @@ class Engine:
                 dev.miss_info = self._count_miss(dev.sent_info, dev.last_info, dev.miss_info)
                 dev.sent_info = now
                 dev.next_info = now + retry_delay(dev.miss_info)
+            elif now >= dev.next_fmt:
+                # Its own tick, not bolted onto the info group: five queries in
+                # one burst is exactly what the FPGA target drops.
+                self.query_info(dev.ip, (proto.Q_SAMPLE_RATES, proto.Q_ENCODINGS))
+                dev.miss_fmt = self._count_miss(dev.sent_fmt, dev.last_fmt, dev.miss_fmt)
+                dev.sent_fmt = now
+                dev.next_fmt = now + (FORMAT_INTERVAL if not dev.miss_fmt
+                                      else retry_delay(dev.miss_fmt))
             else:
                 continue
             dev.last_tx = now

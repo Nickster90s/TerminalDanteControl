@@ -12,7 +12,7 @@ import time
 
 from . import mdns, proto
 
-PAGES = ("Discover", "Sync", "Routing")
+PAGES = ("Discover", "Sync", "Routing", "Device Info")
 
 # Grid glyphs. A subscription a device calls resolved and running looks
 # different from one it merely remembers -- an A16R on the bench holds channels
@@ -265,6 +265,39 @@ SYNC = Table([
 ])
 
 
+def fmt_rate(hz):
+    if not hz:
+        return "-"
+    if hz % 1000 == 0:
+        return "%d k" % (hz // 1000)
+    return "%.1f k" % (hz / 1000.0)
+
+
+def fmt_rate_list(rates):
+    return ", ".join(fmt_rate(r).replace(" k", "k") for r in rates) if rates else "-"
+
+
+def _flag(value, yes="yes", no="no"):
+    return "-" if value is None else (yes if value else no)
+
+
+# Device Info: one row per device, the columns Dante Controller puts in its own
+# Device Info tab, sourced from the info protocol rather than from mDNS.
+DEVINFO = Table([
+    ("NAME", 22, lambda d: (d.display_name, C_ACCENT if d.name else None)),
+    ("MODEL", 18, lambda d: d.model or d.board_name or "-"),
+    ("MFR", 10, lambda d: d.manufacturer or "-"),
+    ("PRODUCT", 9, lambda d: d.product_version or "-"),
+    ("FIRMWARE", 9, lambda d: d.firmware_version or "-"),
+    ("RATE", 6, lambda d: (fmt_rate(d.sample_rate),
+                           C_DIM if not d.sample_rate else None)),
+    ("ENC", 5, lambda d: ("%d bit" % d.encoding).replace(" bit", "b") if d.encoding else "-"),
+    ("ADDRESS", 15, lambda d: d.ip),
+    ("LINK", 7, lambda d: "%d M" % d.link_speed_mbps if d.link_speed_mbps else "-"),
+    ("MAC", 0, lambda d: d.mac or "-"),
+])
+
+
 class App:
     def __init__(self, stdscr, engine, mouse_enabled=True):
         self.stdscr = stdscr
@@ -381,6 +414,8 @@ class App:
             self.page = 1
         elif ch == ord("3"):
             self.page = 2
+        elif ch == ord("4"):
+            self.page = 3
         elif self.page == 2 and ch in (ord("s"), ord("d")):
             self.open_dropdown("tx" if ch == ord("s") else "rx", devices)
         elif self.page == 2 and ch in (curses.KEY_LEFT, ord("h")):
@@ -614,7 +649,7 @@ class App:
 
         self.row_hits = {}
         self.grid_geom = None
-        table = DISCOVER if self.page == 0 else SYNC
+        table = (DISCOVER, SYNC, None, DEVINFO)[self.page]
 
         detail_h = 7
         top = 2
@@ -654,8 +689,10 @@ class App:
             self.put(y, 0, "─" * w, self.attr(C_DIM))
             if self.page == 0:
                 self.draw_discover_detail(y + 1, w, devices[self.sel], detail_h - 1)
-            else:
+            elif self.page == 1:
                 self.draw_sync_detail(y + 1, w, devices[self.sel], detail_h - 1)
+            else:
+                self.draw_devinfo_detail(y + 1, w, devices[self.sel], detail_h - 1)
 
         if self.show_log:
             self.draw_log(w, h)
@@ -727,6 +764,42 @@ class App:
                 self.put(y + i, x, label, self.attr(C_DIM))
                 x += len(label)
                 self.put(y + i, x, str(value), self.attr(C_DEFAULT))
+                x += len(str(value)) + 2
+                if x >= w:
+                    break
+
+    def draw_devinfo_detail(self, y, w, dev, lines):
+        did = dev.device_id.hex() if dev.device_id else "-"
+        svc = []
+        for name, short in ((mdns.SVC_ARC, "arc"), (mdns.SVC_CMC, "cmc")):
+            if name in dev.services:
+                svc.append("%s:%s" % (short, dev.services[name].get("port")))
+        rows = [
+            [("hostname ", dev.hostname or "-"), ("device id ", did),
+             ("board ", dev.board_name or "-"), ("revision ", dev.revision or "-"),
+             ("hardware ", dev.hardware_version or "-")],
+            [("address ", "%s/%s" % (dev.ip, dev.netmask or "?")),
+             ("link ", "%s Mbps" % dev.link_speed_mbps if dev.link_speed_mbps else "-"),
+             ("mac ", dev.mac or "-"), ("services ", " ".join(svc) or "-")],
+            [("rates ", fmt_rate_list(dev.sample_rates)),
+             ("current ", fmt_rate(dev.sample_rate)),
+             ("encodings ", ", ".join("%db" % e for e in dev.encodings)
+              if dev.encodings else "-")],
+            # Reported capabilities, not inferred. A device that never answers
+            # 0x0060 leaves these blank rather than reading as "no".
+            [("channels ", "%s tx / %s rx" % (fmt_int(dev.tx_channels), fmt_int(dev.rx_channels))),
+             ("flows ", "%s tx / %s rx" % (fmt_int(dev.max_tx_flows), fmt_int(dev.max_rx_flows))),
+             ("AES67 ", _flag(dev.aes67)), ("lockable ", _flag(dev.lockable)),
+             ("net config ", _flag(dev.network_configurable))],
+        ]
+        if dev.arc_error:
+            rows.append([("arc ", dev.arc_error)])
+        for i, row in enumerate(rows[:lines]):
+            x = 1
+            for label, value in row:
+                self.put(y + i, x, label, self.attr(C_DIM))
+                x += len(label)
+                self.put(y + i, x, str(value))
                 x += len(str(value)) + 2
                 if x >= w:
                     break
@@ -1053,12 +1126,12 @@ class App:
             self.put(h - 1, 1, self.status[:w - 2], self.attr(C_HEAD, bold=True))
             return
         if self.page == 2:
-            keys = (" q quit   tab/1/2/3 page   s/d device   ↑↓←→ cell   "
+            keys = (" q quit   tab/1/2/3/4 page   s/d device   ↑↓←→ cell   "
                     "enter patch   r refresh   L log ")
             if self.mouse:
                 keys += "  click box/cell, click again to patch "
         else:
-            keys = " q quit   tab/1/2/3 page   ↑↓ select   r refresh   a passive   L log "
+            keys = " q quit   tab/1/2/3/4 page   ↑↓ select   r refresh   a passive   L log "
             if self.mouse:
                 keys += "  click tab/row · shift+drag to select text "
         counters = "mdns %d  info %d  hb %d  arc %d  ptp %d  tx %d" % (

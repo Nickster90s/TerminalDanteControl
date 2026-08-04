@@ -16,7 +16,7 @@ cd TerminalDanteControl
 
 `python3 -m dantectl` is equivalent. Requires Python 3.8+ on Linux.
 
-Keys: `1`/`2`/`3`/`Tab` page · `↑↓`/`jk` select · `r` refresh · `a` passive ·
+Keys: `1`/`2`/`3`/`4`/`Tab` page · `↑↓`/`jk` select · `r` refresh · `a` passive ·
 `L` log · `q` quit. Click the header tabs or a device row with the mouse;
 the wheel moves through the list.
 
@@ -135,6 +135,38 @@ Nothing in the UI claims more than the wire supports. Where a field's meaning is
 unestablished it is shown raw (`clock words 0003 0003`) rather than decoded into
 a confident guess.
 
+## Device Info
+
+One row per device, the same ground Dante Controller's Device Info tab covers,
+sourced from the info protocol rather than from mDNS:
+
+```
+ NAME                   MODEL              MFR        PRODUCT   FIRMWARE  RATE   ENC   ADDRESS         LINK    MAC
+ N-Series-Switchover    N-Series USB 48    Inferno    0.0.1.0   4.1.0.6   48 k   24b   169.254.9.200   1000 M  02:00:00:00:00:42
+ RedNetA16R             RedNet A16R MkII   Focusrite  27.0.0.0  4.2.0.9   48 k   24b   169.254.60.249  1000 M  00:1d:c1:2d:4a:18
+
+ hostname RN-A16R2-2d4a18  device id 001dc1fffe2d4a18  board Brooklyn-3  revision :800  hardware 4.2.0.2
+ address 169.254.60.249/255.255.0.0  link 1000 Mbps  mac 00:1d:c1:2d:4a:18  services arc:4440 cmc:8800
+ rates 44.1k, 48k, 88.2k, 96k, 176.4k, 192k  current 48 k  encodings 24b
+ channels 18 tx / 18 rx  flows 32 tx / 32 rx  AES67 yes  lockable yes  net config yes
+```
+
+| Source | Gives |
+|---|---|
+| device info `0x0060` | firmware and hardware version, board name, and the capability flags — AES67, device lock, network configurable |
+| product info `0x00c0` | manufacturer, model name, product version |
+| network info `0x0011` | address, netmask, MAC, link speed |
+| sample rates `0x0080` (asked with `0x81`) | current rate and every rate the device supports |
+| encodings `0x0082` (asked with `0x83`) | current bit depth and the supported set |
+| ARC `0x1000` / `0x1003` | channel counts, flow limits, hostname, board, revision |
+
+Capability flags are shown only when the device reported them: a device that
+never answers `0x0060` leaves them blank rather than reading as "no".
+
+Formats are asked for on their own schedule — once on discovery, then every two
+minutes — rather than being bolted onto the device-info group. Five queries in
+one burst is exactly the pattern the FPGA target drops.
+
 ## Routing
 
 A patchbay for one pair of devices: pick a transmitter and a receiver in the two
@@ -218,7 +250,14 @@ with code `0x0022`, and rejects a leading `0000` with `0x0023`. Only
 `0001 <start> 0000` is answered. Found by sweeping the request shape against the
 device; `channels_request()` carries the result.
 
-**4. Some devices drop control requests that arrive in a burst.** Measured, and
+**4. Dante Virtual Soundcard announces but answers nothing.** The DVS instance
+on the bench (a MacBook) replies to no unicast info query at all — `0x61`,
+`0xc1`, `0x13`, `0x21`, `0x81`, `0x83` are all met with silence — yet its model
+name and manufacturer arrive anyway, because it announces them on the info
+group. Its channel counts come from ARC, which it does answer. So Device Info
+shows what it volunteers and leaves the rest blank.
+
+**5. Some devices drop control requests that arrive in a burst.** Measured, and
 the reason this tool paces itself:
 
 | target | ARC alone, 1.6 Hz | ARC + 4 info queries in the same burst |
@@ -245,7 +284,7 @@ exponential backoff to 60 s rather than waiting a full poll interval.
 | `dantectl/mdns.py` | minimal one-shot mDNS: DNS codec with compression, `_netaudio-*` browse and resolve |
 | `dantectl/proto.py` | ARC/CMC 10-byte framing and the 32-byte info framing, with each parser's provenance in comments |
 | `dantectl/engine.py` | one background thread: sockets, poll schedule, device registry |
-| `dantectl/ui.py` | the three curses pages, the routing grid, mouse handling |
+| `dantectl/ui.py` | the four curses pages, the routing grid, mouse handling |
 | `dantectl/__main__.py` | argument parsing, `--list` / `--json` modes |
 
 `proto.py` is the piece worth reading first: it documents both framings and the
