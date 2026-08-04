@@ -16,7 +16,7 @@ cd TerminalDanteControl
 
 `python3 -m dantectl` is equivalent. Requires Python 3.8+ on Linux.
 
-Keys: `1`/`2`/`3`/`4`/`Tab` page · `↑↓`/`jk` select · `r` refresh · `a` passive ·
+Keys: `1`…`5`/`Tab` page · `↑↓`/`jk` select · `r` refresh · `a` passive ·
 `L` log · `q` quit. Click the header tabs or a device row with the mouse;
 the wheel moves through the list.
 
@@ -167,6 +167,52 @@ Formats are asked for on their own schedule — once on discovery, then every tw
 minutes — rather than being bolted onto the device-info group. Five queries in
 one burst is exactly the pattern the FPGA target drops.
 
+## Network
+
+What the device says about its interface, next to what this host actually
+measures of it — the two disagreeing is the interesting case.
+
+```
+ NAME                   ADDRESS         NETMASK       GATEWAY   LINK    ARC RTT  ARC OK      HB/s  AGE
+ N-Series-Switchover    169.254.9.200   255.255.0.0   0.0.0.0   1 Gbps  1.0 ms   25% 1/4     1.00  now
+ RedNetA16R             169.254.60.249  255.255.0.0   0.0.0.0   1 Gbps  0.7 ms   100% 2/2    3.00  now
+
+ address 169.254.60.249 / 255.255.0.0  gateway 0.0.0.0  dns 0.0.0.0  mac 00:1d:c1:2d:4a:18  link 1 Gbps
+ arc round trip 0.8 ms (min 0.5 / max 0.8)  arc answered 2/2  heartbeat 3.00 datagrams/s  outstanding none
+ ports arc:4440 cmc:8800  last info 14s ago  last arc 31s ago
+ config network configurable: yes   capability bytes 0e78f65b
+```
+
+**Reported** — address, netmask, gateway, DNS, MAC and link speed, from network
+info `0x0011`. That reply carries **one** interface on every device tested; there
+is no secondary block in it, so there are no Secondary columns rather than empty
+ones.
+
+**Measured** — ARC round trip (last, min, max), the share of ARC requests that
+came back, and heartbeat datagrams per second. Only ARC is timed, because only
+its replies echo our sequence number: device/product/network info replies carry
+the *device's* seqnum and clock stats arrive on the multicast group, so neither
+can be matched to a request and counting them would produce a meaningless ratio.
+
+This is where the FPGA target's burst-drop bug shows up as a number: it sits at
+25% ARC answered while every other device on the bench is at 100%. Heartbeat
+rate is reported as measured rather than assumed — the FPGA and the AM2 send
+1.00/s, the A16R 3.00/s and a DVS instance 3.84/s.
+
+### Configuration is reported, not offered
+
+The page shows whether a device says it is network-configurable, and its raw
+capability bytes (`0x14`–`0x17` of device info, documented as covering identify,
+sample rate and encoding configuration, reboot and factory reset — but which bit
+is which was never established).
+
+**dantectl does not write any of it.** No network-config or device-rename opcode
+appears in either reference implementation this was built from, so implementing
+one would mean guessing a write opcode and aiming it at hardware carrying live
+audio. Renaming is not harmless either: subscriptions reference a transmitter by
+name, so a rename silently breaks every patch pointing at that device. If those
+opcodes get established from a capture, this is the page they belong on.
+
 ## Routing
 
 A patchbay for one pair of devices: pick a transmitter and a receiver in the two
@@ -284,7 +330,7 @@ exponential backoff to 60 s rather than waiting a full poll interval.
 | `dantectl/mdns.py` | minimal one-shot mDNS: DNS codec with compression, `_netaudio-*` browse and resolve |
 | `dantectl/proto.py` | ARC/CMC 10-byte framing and the 32-byte info framing, with each parser's provenance in comments |
 | `dantectl/engine.py` | one background thread: sockets, poll schedule, device registry |
-| `dantectl/ui.py` | the four curses pages, the routing grid, mouse handling |
+| `dantectl/ui.py` | the five curses pages, the routing grid, mouse handling |
 | `dantectl/__main__.py` | argument parsing, `--list` / `--json` modes |
 
 `proto.py` is the piece worth reading first: it documents both framings and the

@@ -12,7 +12,7 @@ import time
 
 from . import mdns, proto
 
-PAGES = ("Discover", "Sync", "Routing", "Device Info")
+PAGES = ("Discover", "Sync", "Routing", "Device Info", "Network")
 
 # Grid glyphs. A subscription a device calls resolved and running looks
 # different from one it merely remembers -- an A16R on the bench holds channels
@@ -298,6 +298,54 @@ DEVINFO = Table([
 ])
 
 
+def fmt_link(mbps):
+    if not mbps:
+        return "-"
+    return "1 Gbps" if mbps == 1000 else "%d Mbps" % mbps
+
+
+def _rtt_cell(dev):
+    if dev.rtt_ms is None:
+        return ("-", C_DIM)
+    attr = C_GOOD if dev.rtt_ms < 20 else (C_WARN if dev.rtt_ms < 200 else C_BAD)
+    return ("%.1f ms" % dev.rtt_ms, attr)
+
+
+def _answered_cell(dev):
+    """ARC requests answered. Only ARC is counted -- see Engine.query_info."""
+    pct = dev.answered_pct
+    if pct is None:
+        return ("-", C_DIM)
+    attr = C_GOOD if pct >= 95 else (C_WARN if pct >= 70 else C_BAD)
+    return ("%d%% %d/%d" % (pct, dev.req_ok, dev.req_sent), attr)
+
+
+def _hb_cell(dev):
+    rate = dev.hb_rate
+    if rate is None:
+        return ("-", C_DIM)
+    # Every device on the bench heartbeats at 1 Hz; well under that is loss.
+    attr = C_GOOD if rate >= 0.8 else (C_WARN if rate >= 0.4 else C_BAD)
+    return ("%.2f" % rate, attr)
+
+
+# Network: what the device says about its interface, next to what this host
+# actually measures of it. The two disagreeing is the interesting case.
+NETWORK = Table([
+    ("NAME", 22, lambda d: (d.display_name, C_ACCENT if d.name else None)),
+    ("ADDRESS", 15, lambda d: d.ip),
+    ("NETMASK", 13, lambda d: d.netmask or "-"),
+    ("GATEWAY", 13, lambda d: (d.gateway or "-",
+                               C_DIM if d.gateway in (None, "0.0.0.0") else None)),
+    ("LINK", 7, lambda d: (fmt_link(d.link_speed_mbps),
+                           C_DIM if not d.link_speed_mbps else None)),
+    ("ARC RTT", 8, _rtt_cell),
+    ("ARC OK", 11, _answered_cell),
+    ("HB/s", 5, _hb_cell),
+    ("AGE", 0, lambda d: (fmt_age(d.age), C_WARN if d.age > 30 else None)),
+])
+
+
 class App:
     def __init__(self, stdscr, engine, mouse_enabled=True):
         self.stdscr = stdscr
@@ -416,6 +464,8 @@ class App:
             self.page = 2
         elif ch == ord("4"):
             self.page = 3
+        elif ch == ord("5"):
+            self.page = 4
         elif self.page == 2 and ch in (ord("s"), ord("d")):
             self.open_dropdown("tx" if ch == ord("s") else "rx", devices)
         elif self.page == 2 and ch in (curses.KEY_LEFT, ord("h")):
@@ -649,7 +699,7 @@ class App:
 
         self.row_hits = {}
         self.grid_geom = None
-        table = (DISCOVER, SYNC, None, DEVINFO)[self.page]
+        table = (DISCOVER, SYNC, None, DEVINFO, NETWORK)[self.page]
 
         detail_h = 7
         top = 2
@@ -691,8 +741,10 @@ class App:
                 self.draw_discover_detail(y + 1, w, devices[self.sel], detail_h - 1)
             elif self.page == 1:
                 self.draw_sync_detail(y + 1, w, devices[self.sel], detail_h - 1)
-            else:
+            elif self.page == 3:
                 self.draw_devinfo_detail(y + 1, w, devices[self.sel], detail_h - 1)
+            else:
+                self.draw_network_detail(y + 1, w, devices[self.sel], detail_h - 1)
 
         if self.show_log:
             self.draw_log(w, h)
@@ -764,6 +816,50 @@ class App:
                 self.put(y + i, x, label, self.attr(C_DIM))
                 x += len(label)
                 self.put(y + i, x, str(value), self.attr(C_DEFAULT))
+                x += len(str(value)) + 2
+                if x >= w:
+                    break
+
+    def draw_network_detail(self, y, w, dev, lines):
+        svc = []
+        for name, short in ((mdns.SVC_ARC, "arc"), (mdns.SVC_CMC, "cmc")):
+            if name in dev.services:
+                svc.append("%s:%s" % (short, dev.services[name].get("port")))
+        rtt = "-"
+        if dev.rtt_ms is not None:
+            rtt = "%.1f ms (min %.1f / max %.1f)" % (dev.rtt_ms, dev.rtt_min, dev.rtt_max)
+        misses = [n for n, v in (("arc", dev.miss_arc), ("info", dev.miss_info),
+                                 ("clock", dev.miss_clock), ("formats", dev.miss_fmt)) if v]
+        rows = [
+            [("address ", "%s / %s" % (dev.ip, dev.netmask or "?")),
+             ("gateway ", dev.gateway or "-"), ("dns ", dev.dns or "-"),
+             ("mac ", dev.mac or "-"),
+             ("link ", fmt_link(dev.link_speed_mbps))],
+            [("arc round trip ", rtt),
+             ("arc answered ", "%d/%d" % (dev.req_ok, dev.req_sent)),
+             ("heartbeat ", "%.2f datagrams/s" % dev.hb_rate if dev.hb_rate else "-"),
+             ("outstanding ", ", ".join(misses) if misses else "none")],
+            [("ports ", " ".join(svc) or "-"),
+             ("last info ", "%s ago" % fmt_age(time.monotonic() - dev.last_info)
+              if dev.last_info else "never"),
+             ("last arc ", "%s ago" % fmt_age(time.monotonic() - dev.last_arc)
+              if dev.last_arc else "never")],
+        ]
+        # Configuration is REPORTED, not offered. Dante's network-config and
+        # rename opcodes are not established in any reference this was written
+        # from, and guessing a write opcode at a device that carries live audio
+        # is not a thing to do speculatively.
+        cfg = "network configurable: %s" % _flag(dev.network_configurable)
+        if dev.flag_bytes:
+            cfg += "   capability bytes %s" % dev.flag_bytes.hex()
+        cfg += "   -- dantectl does not write network config (opcodes unestablished)"
+        rows.append([("config ", cfg)])
+        for i, row in enumerate(rows[:lines]):
+            x = 1
+            for label, value in row:
+                self.put(y + i, x, label, self.attr(C_DIM))
+                x += len(label)
+                self.put(y + i, x, str(value))
                 x += len(str(value)) + 2
                 if x >= w:
                     break
@@ -1126,12 +1222,12 @@ class App:
             self.put(h - 1, 1, self.status[:w - 2], self.attr(C_HEAD, bold=True))
             return
         if self.page == 2:
-            keys = (" q quit   tab/1/2/3/4 page   s/d device   ↑↓←→ cell   "
+            keys = (" q quit   tab/1..5 page   s/d device   ↑↓←→ cell   "
                     "enter patch   r refresh   L log ")
             if self.mouse:
                 keys += "  click box/cell, click again to patch "
         else:
-            keys = " q quit   tab/1/2/3/4 page   ↑↓ select   r refresh   a passive   L log "
+            keys = " q quit   tab/1..5 page   ↑↓ select   r refresh   a passive   L log "
             if self.mouse:
                 keys += "  click tab/row · shift+drag to select text "
         counters = "mdns %d  info %d  hb %d  arc %d  ptp %d  tx %d" % (

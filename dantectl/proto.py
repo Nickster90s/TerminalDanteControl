@@ -348,6 +348,11 @@ def parse_device_info(content):
         "lockable": bool(content[0x14] & 0x08),
         "has_manufacturer": bool(content[0x16] & 0x10),
         "network_configurable": bool(content[0x16] & 0x40),
+        # Kept raw as well. 0x17 is documented as covering identify, sample
+        # rate / encoding configuration, reboot and factory reset, but which
+        # bit is which was never established, so it is shown rather than
+        # decoded into four confident booleans.
+        "flag_bytes": bytes(content[0x14:0x18]),
     }
 
 
@@ -406,6 +411,7 @@ def parse_network_info(content):
         "ip": socket.inet_ntoa(content[16:20]),
         "netmask": socket.inet_ntoa(content[20:24]),
         "gateway": socket.inet_ntoa(content[24:28]),
+        "dns": socket.inet_ntoa(content[28:32]),
     }
 
 

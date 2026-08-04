@@ -78,6 +78,8 @@ class Device:
         "next_chan_tx", "next_chan_rx", "chan_burst_until",
         "sample_rates", "encoding", "encodings", "aes67", "lockable",
         "network_configurable", "next_fmt", "sent_fmt", "miss_fmt", "last_fmt",
+        "gateway", "dns", "flag_bytes", "rtt_ms", "rtt_min", "rtt_max",
+        "req_sent", "req_ok", "hb_times",
     )
 
     def __init__(self, ip):
@@ -161,6 +163,18 @@ class Device:
         self.sent_fmt = 0.0
         self.miss_fmt = 0
         self.last_fmt = 0.0
+        self.gateway = None
+        self.dns = None
+        self.flag_bytes = None
+        # Measured, not reported: what this host actually sees of the device.
+        # A device can look perfectly healthy in its own status fields while
+        # answering one request in three.
+        self.rtt_ms = None          # last ARC round trip
+        self.rtt_min = None
+        self.rtt_max = None
+        self.req_sent = 0
+        self.req_ok = 0
+        self.hb_times = deque(maxlen=40)
 
     # -- derived ----------------------------------------------------------
 
@@ -198,6 +212,27 @@ class Device:
     @property
     def sync_inferred(self):
         return self.sync_state.endswith("~")
+
+    @property
+    def hb_rate(self):
+        """Heartbeats per second as actually received, over the last few.
+
+        Real devices send at 1 Hz. A figure well below that is packet loss or a
+        struggling device, and it is the kind of thing that shows up here long
+        before anything else notices.
+        """
+        if len(self.hb_times) < 2:
+            return None
+        span = self.hb_times[-1] - self.hb_times[0]
+        if span <= 0:
+            return None
+        return (len(self.hb_times) - 1) / span
+
+    @property
+    def answered_pct(self):
+        if not self.req_sent:
+            return None
+        return 100.0 * min(self.req_ok, self.req_sent) / self.req_sent
 
     @property
     def is_leader(self):
@@ -270,6 +305,7 @@ class Engine:
         self.socket_errors = []
 
         self._seq = 0x1000
+        self._sent_at = {}              # seq -> (ip, sent time), for round trips
         # IPs of the two devices the Routing page is showing, if any.
         self.route_tx_ip = None
         self.route_rx_ip = None
@@ -540,6 +576,7 @@ class Engine:
                 hb = proto.parse_heartbeat(content)
                 if hb:
                     dev.last_heartbeat = time.monotonic()
+                    dev.hb_times.append(dev.last_heartbeat)
                     dev.heartbeat.update(hb)
                     if "freq_offset_ppb" in hb:
                         dev.ppb_history.append((time.monotonic(), hb["freq_offset_ppb"]))
@@ -567,6 +604,7 @@ class Engine:
                 dev.hardware_version = di.get("hardware_version") or dev.hardware_version
                 dev.board_name = di.get("board_name_long") or di.get("board_name") or dev.board_name
                 if di:
+                    dev.flag_bytes = di.get("flag_bytes")
                     dev.aes67 = di.get("supports_aes67")
                     dev.lockable = di.get("lockable")
                     dev.network_configurable = di.get("network_configurable")
@@ -596,6 +634,8 @@ class Engine:
                 dev.mac = ni.get("mac") or dev.mac
                 dev.link_speed_mbps = ni.get("link_speed_mbps") or dev.link_speed_mbps
                 dev.netmask = ni.get("netmask") or dev.netmask
+                dev.gateway = ni.get("gateway") or dev.gateway
+                dev.dns = ni.get("dns") or dev.dns
                 dev.last_info = time.monotonic()
             else:
                 self.stats["unknown_info"] += 1
@@ -618,6 +658,7 @@ class Engine:
             dev.last_seen = dev.last_arc
             dev.miss_arc = 0
             dev.next_arc = dev.last_arc + self.arc_interval
+            self._timed(msg["seq"], dev)
             if not msg["ok"]:
                 dev.arc_error = "opcode 0x%04x -> code 0x%04x" % (msg["opcode1"], msg["opcode2"])
                 if msg["opcode1"] in (proto.OP_GET_TX_CHANNELS, proto.OP_GET_RX_CHANNELS,
@@ -719,6 +760,27 @@ class Engine:
         self._seq = (self._seq + 1) & 0xFFFF
         return self._seq
 
+    def _stamp(self, seq, ip):
+        """Remember when a request went out, so its reply can be timed."""
+        self._sent_at[seq] = (ip, time.monotonic())
+        if len(self._sent_at) > 256:                # bounded; unanswered ones rot
+            for old in sorted(self._sent_at)[:64]:
+                self._sent_at.pop(old, None)
+        dev = self.devices.get(ip)
+        if dev:
+            dev.req_sent += 1
+
+    def _timed(self, seq, dev):
+        """Close the loop on a reply: round trip and answered-request count."""
+        entry = self._sent_at.pop(seq, None)
+        dev.req_ok += 1
+        if not entry or entry[0] != dev.ip:
+            return
+        rtt = (time.monotonic() - entry[1]) * 1000.0
+        dev.rtt_ms = rtt
+        dev.rtt_min = rtt if dev.rtt_min is None else min(dev.rtt_min, rtt)
+        dev.rtt_max = rtt if dev.rtt_max is None else max(dev.rtt_max, rtt)
+
     def _send(self, sock_name, data, dest):
         sock = self.sockets.get(sock_name)
         if sock is None or self.passive:
@@ -744,11 +806,17 @@ class Engine:
 
     def query_arc(self, ip):
         for opcode in (proto.OP_GET_DEVICE_NAMES, proto.OP_CHANNEL_COUNTS):
-            self._send("arc", proto.arc_request(opcode, self._next_seq()), (ip, proto.PORT_ARC))
+            seq = self._next_seq()
+            self._stamp(seq, ip)
+            self._send("arc", proto.arc_request(opcode, seq), (ip, proto.PORT_ARC))
 
     def query_info(self, ip, queries):
         for q in queries:
-            self._send("info", proto.info_request(q, self._next_seq()), (ip, proto.PORT_INFO_REQ))
+            # Deliberately not stamped: an info reply carries the device's own
+            # seqnum, not ours, and clock stats come back on the multicast
+            # group, so neither can be matched to a request. Only ARC is timed.
+            self._send("info", proto.info_request(q, self._next_seq()),
+                       (ip, proto.PORT_INFO_REQ))
 
     # -- routing ----------------------------------------------------------
 
