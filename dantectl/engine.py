@@ -52,7 +52,7 @@ CHANNEL_INTERVAL = 6.0     # re-read the routing grid's channel lists this often
 # unresolved first and only becomes active once the receiver has found the
 # transmitter and set up a flow. Waiting a full interval for either reads as
 # "the patch did not take".
-CHANNEL_BURST_INTERVAL = 1.0
+CHANNEL_BURST_INTERVAL = 0.5
 CHANNEL_BURST_SECS = 12.0
 
 
@@ -221,6 +221,21 @@ class Engine:
         self.passive = passive          # listen only, never transmit
         self.want_ptp = want_ptp
 
+        # Everything outside the chosen interface's subnet is ignored.
+        #
+        # A host with a foot in both networks -- a laptop running Dante Via on
+        # the AoIP link-local AND on the office LAN -- advertises both addresses
+        # over mDNS. Accepting the second one puts it in the device list twice,
+        # and unicast requests to it leave via the default route, i.e. the very
+        # interface this tool is supposed to keep off. It also produces two
+        # identically named entries in the routing selectors, one of which can
+        # never answer.
+        mask = net.netmask_of(ifname) or (
+            "255.255.0.0" if ifaddr.startswith("169.254.") else "255.255.255.0")
+        self._mask = struct.unpack(">I", socket.inet_aton(mask))[0]
+        self._subnet = struct.unpack(">I", socket.inet_aton(ifaddr))[0] & self._mask
+        self.netmask = mask
+
         self.lock = threading.RLock()
         self.devices = {}               # ip -> Device
         self.instances = {}             # service instance fqdn -> dict
@@ -231,6 +246,7 @@ class Engine:
             "tx": 0, "unknown_info": 0,
         }
         self.ptp = {}                   # source uuid -> {"last": t, "seq":, "count":}
+        self._off_subnet = set()        # addresses ignored, logged once each
         self.ptp_available = False
         self.sockets = {}
         self.socket_errors = []
@@ -432,6 +448,8 @@ class Engine:
             if not ip:
                 continue
             dev = self._device(ip)
+            if dev is None:
+                continue
             dev.hostname = target.split(".")[0]
             svc = inst["svc"]
             dev.services[svc] = {
@@ -459,9 +477,23 @@ class Engine:
                 dev.manufacturer = txt["mf"]
             dev.last_seen = max(dev.last_seen, inst.get("seen", 0.0))
 
+    def on_subnet(self, ip):
+        try:
+            return struct.unpack(">I", socket.inet_aton(ip))[0] & self._mask == self._subnet
+        except OSError:
+            return False
+
     def _device(self, ip):
+        """The device at `ip`, or None if it is not on our interface's subnet."""
         dev = self.devices.get(ip)
         if dev is None:
+            if not self.on_subnet(ip):
+                if ip not in self._off_subnet:
+                    self._off_subnet.add(ip)
+                    self._note("ignoring %s -- not on %s (%s/%s)"
+                               % (ip, self.ifname, self.ifaddr, self.netmask))
+                self.stats["off_subnet"] = self.stats.get("off_subnet", 0) + 1
+                return None
             dev = Device(ip)
             dev.is_self = (ip == self.ifaddr)
             self.devices[ip] = dev
@@ -477,6 +509,8 @@ class Engine:
         ip = addr[0]
         with self.lock:
             dev = self._device(ip)
+            if dev is None:
+                return
             dev.last_seen = time.monotonic()
             if not dev.device_id and any(msg["device_id"]):
                 dev.device_id = msg["device_id"]
@@ -542,6 +576,8 @@ class Engine:
             return
         with self.lock:
             dev = self._device(addr[0])
+            if dev is None:
+                return
             dev.last_arc = time.monotonic()
             dev.last_seen = dev.last_arc
             dev.miss_arc = 0

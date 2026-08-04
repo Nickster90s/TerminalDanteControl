@@ -40,6 +40,7 @@ SPARK = " ▁▂▃▄▅▆▇█"
 # Mouse buttons. BUTTON5 (wheel down) is missing from some ncurses builds, so
 # fall back to its documented bit rather than crashing at import.
 BUTTON5 = getattr(curses, "BUTTON5_PRESSED", 0x00200000)
+DOUBLE1 = getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0x00000008)
 
 
 def enable_mouse():
@@ -53,7 +54,7 @@ def enable_mouse():
     """
     try:
         avail, _ = curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED |
-                                    curses.BUTTON4_PRESSED | BUTTON5)
+                                    DOUBLE1 | curses.BUTTON4_PRESSED | BUTTON5)
     except (curses.error, AttributeError):
         return False
     if not avail:
@@ -341,9 +342,22 @@ class App:
     def handle_key(self, ch):
         devices = self.engine.snapshot()
 
-        # A pending write owns the keyboard until it is answered. Only an
-        # explicit y goes ahead; every other key cancels.
+        # A pending write owns the KEYBOARD until it is answered. Mouse events
+        # are swallowed, never treated as an answer.
+        #
+        # This is what made a confirmed patch look like it cancelled itself: the
+        # button release that follows the very click which opened the prompt
+        # arrived as another event, "any other key" cancelled on it, and the y
+        # typed a moment later landed on a prompt that was already gone. Doing
+        # it all from the keyboard worked, which is exactly the shape of that
+        # bug.
         if self.confirm:
+            if ch == curses.KEY_MOUSE:
+                try:
+                    curses.getmouse()
+                except curses.error:
+                    pass
+                return True
             action = self.confirm
             self.confirm = None
             if ch in (ord("y"), ord("Y")):
@@ -449,7 +463,14 @@ class App:
         return True
 
     def toggle_subscription(self, devices):
-        """Ask before writing. This is the one thing that changes a device."""
+        """Patch the cell under the cursor.
+
+        Only DESTRUCTIVE writes ask first. Patching a free receive channel
+        takes nothing away, so it happens immediately -- a prompt there is
+        just a keystroke between the user and the obvious intent. Replacing a
+        subscription or clearing one can take audio off air, so those still
+        need an explicit y.
+        """
         tx_dev = self._by_ip(devices, self.route_tx_ip)
         rx_dev = self._by_ip(devices, self.route_rx_ip)
         if not tx_dev or not rx_dev:
@@ -477,20 +498,24 @@ class App:
         else:
             tx_name = tc["name"]
             tx_host = tx_dev.name or tx_dev.hostname or ""
-            # Say so when this overwrites an existing patch. A receive channel
-            # holds one subscription, so quietly replacing one is a way to take
-            # audio off air without meaning to.
-            verb = "SUBSCRIBE"
-            if rc["tx_name"]:
-                verb = "REPLACE %s@%s ON" % (rc["tx_name"], rc["tx_host"] or "?")
+            done = ("subscribe sent: %s Rx%d <- %s@%s -- reading back"
+                    % (rx_dev.display_name, rx_id, tx_name, tx_host))
+            if not rc["tx_name"]:
+                # Free channel: just do it.
+                ok = self._write(engine.subscribe(rx_ip, rx_id, tx_name, tx_host),
+                                 rx_ip, rx_id, tx_name)
+                self.flash(done if ok else
+                           "refused: passive mode is on (press a to allow writes)")
+                return
+            # Occupied channel: this replaces a live subscription, so ask.
             self.confirm = {
-                "text": "%s %s Rx%d '%s' <- '%s'@%s?"
-                        % (verb, rx_dev.display_name, rx_id, rc["label"], tx_name, tx_host),
+                "text": "REPLACE %s@%s ON %s Rx%d '%s' with '%s'@%s?"
+                        % (rc["tx_name"], rc["tx_host"] or "?", rx_dev.display_name,
+                           rx_id, rc["label"], tx_name, tx_host),
                 "action": lambda: self._write(
                     engine.subscribe(rx_ip, rx_id, tx_name, tx_host),
                     rx_ip, rx_id, tx_name),
-                "done": "subscribe sent: %s Rx%d <- %s@%s -- reading back"
-                        % (rx_dev.display_name, rx_id, tx_name, tx_host),
+                "done": done,
             }
 
     def _write(self, sent, rx_ip, rx_id, tx_name):
@@ -509,9 +534,11 @@ class App:
             step = -3 if bstate & curses.BUTTON4_PRESSED else 3
             self.sel = max(0, min(self.sel + step, max(0, len(devices) - 1)))
             return
-        # Terminals differ on whether a click arrives as CLICKED or as a bare
-        # PRESSED, so accept either.
-        if not bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+        # Terminals differ on whether a click arrives as CLICKED, as a bare
+        # PRESSED, or (when the button is held past mouseinterval) as PRESSED
+        # with the release reported separately, so accept any of them.
+        double = bool(bstate & DOUBLE1)
+        if not bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | DOUBLE1):
             return
         for ty, x0, x1, page in self.tab_hits:
             if y == ty and x0 <= x <= x1:
@@ -547,13 +574,14 @@ class App:
                     self.cur_row = row
                     return
                 col = self.grid_scroll_col + (x - gx0) // COL_PITCH
-                # Clicking the cell the cursor is already on is the commit
-                # gesture -- so a first click always just aims, and patching a
-                # device is never one stray click away.
-                if (row, col) == (self.cur_row, self.cur_col):
+                # A double click patches. So does a second single click on the
+                # cell the cursor already sits on, since a terminal that does
+                # not report double clicks would otherwise have no gesture at
+                # all. Either way the first click on a new cell only aims.
+                already = (row, col) == (self.cur_row, self.cur_col)
+                self.cur_row, self.cur_col = row, col
+                if double or already:
                     self.toggle_subscription(devices)
-                else:
-                    self.cur_row, self.cur_col = row, col
             return
 
         if y in self.row_hits:
@@ -996,7 +1024,10 @@ class App:
     def draw_confirm(self, w, h):
         c = self.confirm
         self.put(h - 1, 0, " " * w, self.attr(C_WARN) | curses.A_REVERSE)
-        text = " %s   [y] yes   [any other key] cancel " % c["text"]
+        # Say "type", because the mouse cannot answer this: clicks are ignored
+        # while it is up so that the release from the click that opened it
+        # cannot dismiss it.
+        text = " %s   type [y] to confirm, any other key cancels " % c["text"]
         self.put(h - 1, 0, text[:w], self.attr(C_WARN) | curses.A_REVERSE | curses.A_BOLD)
 
     def draw_log(self, w, h):

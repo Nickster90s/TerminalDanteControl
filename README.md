@@ -52,6 +52,13 @@ prefers a **link-local 169.254/16** address (what an un-DHCPed Dante network
 looks like) and never auto-picks the interface holding the default route — so it
 does not start spraying mDNS at the house network.
 
+**Addresses outside that interface's subnet are ignored**, and the log says so.
+A host with a foot in both networks — a laptop running Dante Via on the AoIP
+link-local *and* on the office LAN — advertises both addresses over mDNS.
+Accepting the second one lists it twice, sends unicast requests out the default
+route, and puts two identically named entries in the routing selectors, one of
+which can never answer.
+
 ## Discover
 
 | Source | Gives |
@@ -155,14 +162,20 @@ channels down the left**, sized by what those two devices actually advertise.
 
 Keys: `s` and `d` open the transmitter and receiver choosers, arrows or `hjkl`
 move the cell cursor, `Enter` patches. With the mouse: click a box to open its
-chooser, click a cell to aim, **click the same cell again to patch**.
+chooser, **double-click a cell to patch it** (or click once to aim and click
+that same cell again, for terminals that do not report double clicks).
 
-**Every patch asks first.** A click only moves the cursor; the write needs a
-second click or `Enter`, and then a `y` at the confirmation bar. Anything else
-cancels. If the target channel already holds a subscription the prompt says
-`REPLACE <existing> ON ...` rather than `SUBSCRIBE`, because a receive channel
-holds exactly one subscription and silently overwriting one is a way to take
-audio off air without meaning to.
+**Only destructive writes ask.** Patching a free receive channel takes nothing
+away, so it happens immediately. Replacing an existing subscription or clearing
+one can take audio off air, so those raise a confirmation bar that needs a typed
+`y`; the prompt names what is being displaced (`REPLACE 2@Foo ON ...`), because a
+receive channel holds exactly one subscription.
+
+The confirmation is **keyboard only** — mouse events are ignored while it is up.
+That is deliberate: the button release that follows the very click which opened
+the prompt would otherwise be read as "any other key" and dismiss it, so a
+patch confirmed with `y` looked like it had cancelled itself while doing the
+same thing entirely from the keyboard worked.
 
 Channel lists are read only for the two selected devices, and re-read every 6 s
 so the grid reflects what the devices say rather than what was asked for.
